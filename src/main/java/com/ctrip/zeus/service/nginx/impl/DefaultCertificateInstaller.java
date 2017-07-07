@@ -17,7 +17,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.unidal.dal.jdbc.DalException;
 
-import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
 import java.io.*;
 import java.util.*;
@@ -39,7 +38,6 @@ public class DefaultCertificateInstaller implements CertificateInstaller {
     private VirtualServerRepository virtualServerRepository;
 
     private final CertificateConfig config = new CertificateConfig();
-    private final String localhost = "_localhost";
 
     @Override
     public CertificateConfig getConfig() {
@@ -47,22 +45,16 @@ public class DefaultCertificateInstaller implements CertificateInstaller {
     }
 
     @Override
-    public void installDefault() throws Exception {
+    public void installDefault(Long certId) throws Exception {
         createSslPath();
 
-        String defaultPath = config.getInstallDir(0L);
-        defaultPath = defaultPath.substring(0, defaultPath.lastIndexOf("/")) + "/default";
+        String defaultPath = config.getDefaultCertInstallDir();
         File f = new File(defaultPath);
-        if (f.exists()) {
-            if (f.isDirectory() && f.listFiles().length == 2) {
-                logger.info(defaultPath + " exists. No need to install default cert.");
-                return;
-            }
-        } else {
+        if (!f.exists()) {
             f.mkdirs();
         }
 
-        CertificateDo cert = certificateDao.findMaxByDomainAndState(localhost, CertificateConfig.ONBOARD, CertificateEntity.READSET_FULL);
+        CertificateDo cert = certificateDao.findById(certId, CertificateEntity.READSET_FULL);
         if (cert == null) {
             logger.error("Could not find default certificate to install.");
             return;
@@ -129,8 +121,7 @@ public class DefaultCertificateInstaller implements CertificateInstaller {
     @Override
     public String localInstall(Long vsId, Long certId) throws Exception {
         CertificateDo cert;
-        if (certId == null ||
-                (cert = certificateDao.findByPK(certId, CertificateEntity.READSET_FULL)) == null) {
+        if (certId == null || (cert = certificateDao.findByPK(certId, CertificateEntity.READSET_FULL)) == null) {
             throw new ValidationException("Some error occurred when searching the certificate.");
         }
 
@@ -153,7 +144,7 @@ public class DefaultCertificateInstaller implements CertificateInstaller {
     }
 
     @Override
-    public void localBatchInstall(Long slbId) throws Exception {
+    public void localBatchInstall(Long slbId, boolean overwriteIfExist) throws Exception {
         Set<IdVersion> searchKey = virtualServerCriteriaQuery.queryBySlbId(slbId);
         Set<Long> next = new HashSet<>();
         for (IdVersion sk : searchKey) {
@@ -169,28 +160,29 @@ public class DefaultCertificateInstaller implements CertificateInstaller {
         File f = new File(rootPath);
         if (!f.exists()) throw new IOException("Certificate root path " + rootPath + " does not exist.");
 
-        Set<Long> curr = new HashSet<>();
-        for (File c : f.listFiles()) {
-            if ("default".equals(c.getName())) continue;
-            try {
-                curr.add(Long.parseLong(c.getName()));
-            } catch (Exception ex) {
+        if (!overwriteIfExist) {
+            Set<Long> curr = new HashSet<>();
+            for (File c : f.listFiles()) {
+                if ("default".equals(c.getName())) continue;
+                try {
+                    curr.add(Long.parseLong(c.getName()));
+                } catch (Exception ex) {
+                }
             }
+            next.removeAll(curr);
         }
-
-        next.removeAll(curr);
         if (next.size() == 0) return;
 
         Set<IdVersion> searchKeys = virtualServerCriteriaQuery.queryByIdsAndMode(next.toArray(new Long[next.size()]), SelectionMode.ONLINE_FIRST);
         Map<Long, String> rVsDomain = new HashMap<>();
         for (VirtualServer vs : virtualServerRepository.listAll(searchKeys.toArray(new IdVersion[searchKeys.size()]))) {
             if (vs.getDomains().size() == 1) {
-                rVsDomain.put(vs.getId(), vs.getDomains().get(0).getName());
+                rVsDomain.put(vs.getId(), vs.getDomains().get(0).getName().toLowerCase());
             }
             if (vs.getDomains().size() > 1) {
                 String[] dd = new String[vs.getDomains().size()];
                 for (int i = 0; i < vs.getDomains().size(); i++) {
-                    dd[i] = vs.getDomains().get(i).getName();
+                    dd[i] = vs.getDomains().get(i).getName().toLowerCase();
                 }
                 Arrays.sort(dd);
                 rVsDomain.put(vs.getId(), Joiner.on("|").join(dd));
@@ -198,21 +190,28 @@ public class DefaultCertificateInstaller implements CertificateInstaller {
         }
 
         Map<String, CertificateDo> rDomainCert = new HashMap<>();
+        //TODO find excluded cert
         for (CertificateDo d : certificateDao.findAllMaxByDomainAndState(rVsDomain.values().toArray(new String[rVsDomain.size()]), CertificateConfig.ONBOARD, CertificateEntity.READSET_FULL)) {
-            rDomainCert.put(d.getDomain(), d);
+            rDomainCert.put(d.getDomain().toLowerCase(), d);
         }
 
         if (rVsDomain.size() > rDomainCert.size()) {
             Set<String> range = new HashSet<>(rVsDomain.values());
             range.removeAll(rDomainCert.keySet());
             if (range.size() > 0)
-                throw new ValidationException("Missing certificates on vses: " + Joiner.on(",").join(range) + ".");
+                throw new ValidationException("Missing certificates of virtual servers: " + Joiner.on(",").join(range) + ".");
         }
 
         for (Map.Entry<Long, String> e : rVsDomain.entrySet()) {
             CertificateDo d = rDomainCert.get(e.getValue());
             writeCertificates(e.getKey(), d);
         }
+    }
+
+    @Override
+    public boolean defaultExists() {
+        String dir = config.getDefaultCertInstallDir();
+        return new File(dir + "/ssl.crt").exists() && new File(dir + "/ssl.key").exists();
     }
 
     @Override

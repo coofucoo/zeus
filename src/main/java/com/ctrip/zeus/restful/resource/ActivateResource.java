@@ -7,9 +7,11 @@ import com.ctrip.zeus.executor.TaskManager;
 import com.ctrip.zeus.model.entity.*;
 import com.ctrip.zeus.restful.message.ResponseHandler;
 import com.ctrip.zeus.service.build.ConfigHandler;
-import com.ctrip.zeus.service.message.queue.MessageQueueService;
+import com.ctrip.zeus.service.message.queue.MessageQueue;
 import com.ctrip.zeus.service.message.queue.MessageType;
-import com.ctrip.zeus.service.model.*;
+import com.ctrip.zeus.service.model.EntityFactory;
+import com.ctrip.zeus.service.model.ModelStatusMapping;
+import com.ctrip.zeus.service.model.TrafficPolicyRepository;
 import com.ctrip.zeus.service.query.GroupCriteriaQuery;
 import com.ctrip.zeus.service.query.SlbCriteriaQuery;
 import com.ctrip.zeus.service.task.constant.TaskOpsType;
@@ -19,8 +21,8 @@ import com.ctrip.zeus.task.entity.OpsTask;
 import com.ctrip.zeus.task.entity.TaskResult;
 import com.ctrip.zeus.task.entity.TaskResultList;
 import com.ctrip.zeus.util.AssertUtils;
-import com.google.common.base.Joiner;
 import com.ctrip.zeus.util.MessageUtil;
+import com.google.common.base.Joiner;
 import com.netflix.config.DynamicLongProperty;
 import com.netflix.config.DynamicPropertyFactory;
 import org.springframework.stereotype.Component;
@@ -57,7 +59,9 @@ public class ActivateResource {
     @Resource
     private GroupCriteriaQuery groupCriteriaQuery;
     @Resource
-    private MessageQueueService messageQueueService;
+    private TrafficPolicyRepository trafficPolicyRepository;
+    @Resource
+    private MessageQueue messageQueue;
     @Resource
     private ConfigHandler configHandler;
 
@@ -81,6 +85,7 @@ public class ActivateResource {
         if (slbModelStatusMapping.getOfflineMapping() == null || slbModelStatusMapping.getOfflineMapping().size() == 0) {
             throw new ValidationException("Not Found Slb By Id.");
         }
+
         for (Long id : _slbIds) {
             if (slbModelStatusMapping.getOfflineMapping().get(id) == null) {
                 throw new ValidationException("Not Found Slb By Id." + id);
@@ -121,9 +126,9 @@ public class ActivateResource {
 
         for (Long slbId : _slbIds) {
             if (configHandler.getEnable("use.new,message.queue.producer", false)) {
-                messageQueueService.produceMessage(request.getRequestURI(), slbId, slbMessageData);
+                messageQueue.produceMessage(request.getRequestURI(), slbId, slbMessageData);
             } else {
-                messageQueueService.produceMessage(MessageType.ActivateSlb, slbId, slbMessageData);
+                messageQueue.produceMessage(MessageType.ActivateSlb, slbId, slbMessageData);
             }
         }
         return responseHandler.handle(resultList, hh.getMediaType());
@@ -132,7 +137,10 @@ public class ActivateResource {
     @GET
     @Path("/group")
     @Authorize(name = "activate")
-    public Response activateGroup(@Context HttpServletRequest request, @Context HttpHeaders hh, @QueryParam("groupId") List<Long> groupIds, @QueryParam("groupName") List<String> groupNames) throws Exception {
+    public Response activateGroup(@Context HttpServletRequest request, @Context HttpHeaders hh,
+                                  @QueryParam("groupId") List<Long> groupIds,
+                                  @QueryParam("force") Boolean force,
+                                  @QueryParam("groupName") List<String> groupNames) throws Exception {
         Set<Long> _groupIds = new HashSet<>();
 
         if (groupIds != null && !groupIds.isEmpty()) {
@@ -205,6 +213,7 @@ public class ActivateResource {
             tmp.addAll(offlineRelatedVsIds);
             tmp.addAll(onlineRelatedVsIds);
 
+            Map<Long, OpsTask> activateTasks = new HashMap<>();
             for (Long vsId : tmp) {
                 VirtualServer vs = vsMap.getOnlineMapping().get(vsId);
                 if (onlineRelatedVsIds.contains(vsId) && !offlineRelatedVsIds.contains(vsId)) {
@@ -215,21 +224,26 @@ public class ActivateResource {
                                 .setSlbVirtualServerId(vsId)
                                 .setOpsType(TaskOpsType.SOFT_DEACTIVATE_GROUP)
                                 .setVersion(offlineVersion.getVersion())
+                                .setSkipValidate(force == null ? false : force)
                                 .setCreateTime(new Date());
                         tasks.add(task);
                     }
                 } else {
                     for (Long slbId : vs.getSlbIds()) {
-                        OpsTask task = new OpsTask();
-                        task.setGroupId(e.getKey())
-                                .setTargetSlbId(slbId)
-                                .setOpsType(TaskOpsType.ACTIVATE_GROUP)
-                                .setVersion(offlineVersion.getVersion())
-                                .setCreateTime(new Date());
-                        tasks.add(task);
+                        if (activateTasks.get(slbId) == null) {
+                            OpsTask task = new OpsTask();
+                            task.setGroupId(e.getKey())
+                                    .setTargetSlbId(slbId)
+                                    .setOpsType(TaskOpsType.ACTIVATE_GROUP)
+                                    .setVersion(offlineVersion.getVersion())
+                                    .setSkipValidate(force == null ? false : force)
+                                    .setCreateTime(new Date());
+                            activateTasks.put(slbId, task);
+                        }
                     }
                 }
             }
+            tasks.addAll(activateTasks.values());
         }
         List<Long> taskIds = taskManager.addTask(tasks);
 
@@ -248,11 +262,11 @@ public class ActivateResource {
 
         String slbMessageData = MessageUtil.getMessageData(request,
                 groupMap.getOfflineMapping().values().toArray(new Group[groupMap.getOfflineMapping().size()]), null, null, null, true);
-        for (Long id : _groupIds) {
+        for (Long id : groupMap.getOfflineMapping().keySet()) {
             if (configHandler.getEnable("use.new,message.queue.producer", false)) {
-                messageQueueService.produceMessage(request.getRequestURI(), id, slbMessageData);
+                messageQueue.produceMessage(request.getRequestURI(), id, slbMessageData);
             } else {
-                messageQueueService.produceMessage(MessageType.ActivateGroup, id, slbMessageData);
+                messageQueue.produceMessage(MessageType.ActivateGroup, id, slbMessageData);
             }
         }
 
@@ -334,10 +348,103 @@ public class ActivateResource {
         String slbMessageData = MessageUtil.getMessageData(request, null,
                 new VirtualServer[]{vsMap.getOfflineMapping().get(vsId)}, null, null, true);
         if (configHandler.getEnable("use.new,message.queue.producer", false)) {
-            messageQueueService.produceMessage(request.getRequestURI(), vsId, slbMessageData);
+            messageQueue.produceMessage(request.getRequestURI(), vsId, slbMessageData);
         } else {
-            messageQueueService.produceMessage(MessageType.ActivateVs, vsId, slbMessageData);
+            messageQueue.produceMessage(MessageType.ActivateVs, vsId, slbMessageData);
         }
+
+        return responseHandler.handle(resultList, hh.getMediaType());
+    }
+
+    @GET
+    @Path("/policy")
+    @Authorize(name = "activate")
+    public Response activatePolicy(@Context HttpServletRequest request,
+                                   @Context HttpHeaders hh,
+                                   @QueryParam("policyId") Long policyId,
+                                   @QueryParam("force") Boolean force) throws Exception {
+        if (policyId == null || policyId <= 0) {
+            throw new ValidationException("Invalidate Parameter policy.");
+        }
+        ModelStatusMapping<TrafficPolicy> trafficPolicyMap = entityFactory.getPoliciesByIds(new Long[]{policyId});
+        if (trafficPolicyMap.getOfflineMapping().size() == 0) {
+            throw new ValidationException("Not Found Policy By Id. Policy Id:" + policyId);
+        }
+
+        TrafficPolicy toActivateObj = trafficPolicyMap.getOfflineMapping().get(policyId);
+        TrafficPolicy activatedObj = trafficPolicyMap.getOnlineMapping().get(policyId);
+
+        Set<Long> vsIds = new HashSet<>();
+        Set<Long> offlineRelatedVsIds = new HashSet<>();
+        Set<Long> onlineRelatedVsIds = new HashSet<>();
+        for (PolicyVirtualServer pvs : toActivateObj.getPolicyVirtualServers()) {
+            offlineRelatedVsIds.add(pvs.getVirtualServer().getId());
+        }
+        if (activatedObj != null) {
+            for (PolicyVirtualServer pvs : activatedObj.getPolicyVirtualServers()) {
+                onlineRelatedVsIds.add(pvs.getVirtualServer().getId());
+            }
+        }
+        vsIds.addAll(offlineRelatedVsIds);
+        vsIds.addAll(onlineRelatedVsIds);
+
+        ModelStatusMapping<VirtualServer> vsMap = entityFactory.getVsesByIds(vsIds.toArray(new Long[]{}));
+
+        for (PolicyVirtualServer pvs : toActivateObj.getPolicyVirtualServers()) {
+            if (!vsMap.getOnlineMapping().containsKey(pvs.getVirtualServer().getId())) {
+                throw new ValidationException("Virtual server " + pvs.getVirtualServer().getId() + " is not activated. PolicyId :" + policyId);
+            }
+        }
+
+        List<OpsTask> tasks = new ArrayList<>();
+        Map<Long, OpsTask> activateTasks = new HashMap<>();
+        for (Long vsId : vsIds) {
+            VirtualServer vs = vsMap.getOnlineMapping().get(vsId);
+            if (onlineRelatedVsIds.contains(vsId) && !offlineRelatedVsIds.contains(vsId)) {
+                for (Long slbId : vs.getSlbIds()) {
+                    OpsTask task = new OpsTask();
+                    task.setPolicyId(policyId)
+                            .setTargetSlbId(slbId)
+                            .setSlbVirtualServerId(vsId)
+                            .setOpsType(TaskOpsType.SOFT_DEACTIVATE_POLICY)
+                            .setVersion(toActivateObj.getVersion())
+                            .setSkipValidate(force == null ? false : force)
+                            .setCreateTime(new Date());
+                    tasks.add(task);
+                }
+            } else {
+                for (Long slbId : vs.getSlbIds()) {
+                    if (activateTasks.get(slbId) == null) {
+                        OpsTask task = new OpsTask();
+                        task.setPolicyId(policyId)
+                                .setTargetSlbId(slbId)
+                                .setOpsType(TaskOpsType.ACTIVATE_POLICY)
+                                .setVersion(toActivateObj.getVersion())
+                                .setSkipValidate(force == null ? false : force)
+                                .setCreateTime(new Date());
+                        activateTasks.put(slbId, task);
+                    }
+                }
+            }
+        }
+        tasks.addAll(activateTasks.values());
+        List<Long> taskIds = taskManager.addTask(tasks);
+
+        List<TaskResult> results = taskManager.getResult(taskIds, apiTimeout.get());
+
+        TaskResultList resultList = new TaskResultList();
+        for (TaskResult t : results) {
+            resultList.addTaskResult(t);
+        }
+        resultList.setTotal(results.size());
+
+        try {
+            propertyBox.set("status", "activated", "policy", policyId);
+        } catch (Exception ex) {
+        }
+
+        String slbMessageData = MessageUtil.getMessageData(request, null, null, null, null, true);
+        messageQueue.produceMessage(request.getRequestURI(), policyId, slbMessageData);
 
         return responseHandler.handle(resultList, hh.getMediaType());
     }

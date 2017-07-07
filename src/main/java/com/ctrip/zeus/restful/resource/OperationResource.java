@@ -1,18 +1,14 @@
 package com.ctrip.zeus.restful.resource;
 
 import com.ctrip.zeus.auth.Authorize;
-import com.ctrip.zeus.dal.core.StatusGroupServerDao;
 import com.ctrip.zeus.exceptions.ValidationException;
 import com.ctrip.zeus.executor.TaskManager;
 import com.ctrip.zeus.model.entity.*;
 import com.ctrip.zeus.restful.message.ResponseHandler;
 import com.ctrip.zeus.service.build.ConfigHandler;
-import com.ctrip.zeus.service.message.queue.MessageQueueService;
+import com.ctrip.zeus.service.message.queue.MessageQueue;
 import com.ctrip.zeus.service.message.queue.MessageType;
 import com.ctrip.zeus.service.model.*;
-import com.ctrip.zeus.service.nginx.CertificateConfig;
-import com.ctrip.zeus.service.nginx.CertificateInstaller;
-import com.ctrip.zeus.service.nginx.CertificateService;
 import com.ctrip.zeus.service.query.GroupCriteriaQuery;
 import com.ctrip.zeus.service.query.SlbCriteriaQuery;
 import com.ctrip.zeus.service.query.VirtualServerCriteriaQuery;
@@ -27,10 +23,8 @@ import com.ctrip.zeus.tag.PropertyBox;
 import com.ctrip.zeus.task.entity.OpsTask;
 import com.ctrip.zeus.task.entity.TaskResult;
 import com.ctrip.zeus.util.MessageUtil;
-import com.google.common.base.Joiner;
 import com.netflix.config.DynamicBooleanProperty;
 import com.netflix.config.DynamicLongProperty;
-import com.google.common.collect.Sets;
 import com.netflix.config.DynamicPropertyFactory;
 import org.glassfish.jersey.media.multipart.FormDataParam;
 import org.slf4j.Logger;
@@ -38,13 +32,16 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.Resource;
+import javax.servlet.RequestDispatcher;
 import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 import javax.ws.rs.*;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.HttpHeaders;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
 import java.io.InputStream;
+import java.net.URI;
 import java.util.*;
 
 /**
@@ -62,21 +59,11 @@ public class OperationResource {
     @Resource
     private GroupRepository groupRepository;
     @Resource
-    private SlbRepository slbRepository;
-    @Resource
     private TaskManager taskManager;
-    @Resource
-    private SlbCriteriaQuery slbCriteriaQuery;
     @Resource
     private GroupCriteriaQuery groupCriteriaQuery;
     @Resource
-    private VirtualServerCriteriaQuery virtualServerCriteriaQuery;
-    @Resource
     private ResponseHandler responseHandler;
-    @Resource
-    private CertificateService certificateService;
-    @Resource
-    private CertificateInstaller certificateInstaller;
     @Resource
     private EntityFactory entityFactory;
     @Resource
@@ -84,7 +71,11 @@ public class OperationResource {
     @Resource
     private PropertyBox propertyBox;
     @Resource
-    private MessageQueueService messageQueueService;
+    private VirtualServerCriteriaQuery virtualServerCriteriaQuery;
+    @Resource
+    private SlbCriteriaQuery slbCriteriaQuery;
+    @Resource
+    private MessageQueue messageQueue;
 
 
     private static DynamicLongProperty apiTimeout = DynamicPropertyFactory.getInstance().getLongProperty("api.timeout", 15000L);
@@ -92,6 +83,14 @@ public class OperationResource {
 
     private Logger logger = LoggerFactory.getLogger(this.getClass());
 
+    /**
+     * @api {get} /api/op/upServer: [OPS] Mark up a server
+     * @apiDescription Mark up server action will take effect on a physical server. It will set `server` status to 'up' to all nesting SLB groups.
+     * @apiName MarkUpServer
+     * @apiGroup Operation
+     * @apiParam {String} ip            server ip address
+     * @apiSuccess {ServerStatus}       server status
+     */
     @GET
     @Path("/upServer")
     @Authorize(name = "upDownServer")
@@ -99,6 +98,14 @@ public class OperationResource {
         return serverOps(request, hh, ip, true);
     }
 
+    /**
+     * @api {get} /api/op/downServer: [OPS] Mark down a server
+     * @apiDescription Mark down server action will take effect on a physical server. It will set `server` status to 'down' to all nesting SLB groups.
+     * @apiName MarkDownServer
+     * @apiGroup Operation
+     * @apiParam {String} ip            server ip address
+     * @apiSuccess {ServerStatus}       server status
+     */
     @GET
     @Path("/downServer")
     @Authorize(name = "upDownServer")
@@ -162,15 +169,6 @@ public class OperationResource {
 
         Long[] gids = entityFactory.getGroupIdsByGroupServerIp(serverip, SelectionMode.ONLINE_FIRST);
 
-        Set<Long> groupIdSet = new HashSet<>();
-        groupIdSet.addAll(Arrays.asList(gids));
-        List<GroupStatus> statuses = groupStatusService.getOfflineGroupsStatus(groupIdSet);
-
-        for (GroupStatus gs : statuses) {
-            addHealthyProperty(gs);
-        }
-
-
         List<Group> groups = groupRepository.list(gids);
 
         if (groups != null) {
@@ -178,15 +176,27 @@ public class OperationResource {
                 ss.addGroupName(group.getName());
             }
         }
+        String slbMessageData = MessageUtil.getMessageData(request, groups.toArray(new Group[]{}), null, null, new String[]{serverip}, true);
         if (configHandler.getEnable("use.new,message.queue.producer", false)) {
-            messageQueueService.produceMessage(request.getRequestURI(), null, serverip);
+            messageQueue.produceMessage(request.getRequestURI(), null, slbMessageData);
         } else {
-            messageQueueService.produceMessage(MessageType.OpsServer, null, serverip);
+            messageQueue.produceMessage(MessageType.OpsServer, null, slbMessageData);
         }
 
         return responseHandler.handle(ss, hh.getMediaType());
     }
 
+    /**
+     * @api {get} /api/op/upMember: [OPS] Mark up member(s)
+     * @apiDescription Mark up group member action will take effect only on a single group. It will set `member` status to 'up' on the specified group.
+     * @apiName MarkUpMember
+     * @apiGroup Operation
+     * @apiParam {Long} groupId         id of the target group whose member needs to be marked up
+     * @apiParam {String} groupName     name of the target group whose member needs to be marked up
+     * @apiParam {String[]} ip        group member ip address(es)
+     * @apiParam {Boolean} batch        if multiple group members needs to be marked up, batch value must be explicitly set to true
+     * @apiSuccess {GroupServerStatusList}   member statuses by group
+     */
     @GET
     @Path("/upMember")
     @Authorize(name = "upDownMember")
@@ -196,7 +206,6 @@ public class OperationResource {
                              @QueryParam("groupName") String groupName,
                              @QueryParam("ip") List<String> ips,
                              @QueryParam("batch") Boolean batch) throws Exception {
-        List<String> _ips = new ArrayList<>();
         if (groupId == null) {
             if (groupName == null) {
                 throw new ValidationException("Group Id or Name not found!");
@@ -204,37 +213,22 @@ public class OperationResource {
                 groupId = groupCriteriaQuery.queryByName(groupName);
             }
         }
+        batch = batch == null ? false : batch;
 
-        Group gp = groupRepository.getById(groupId);
-        if (null != batch && batch.equals(true)) {
-            List<GroupServer> servers = gp.getGroupServers();
-            for (GroupServer gs : servers) {
-                _ips.add(gs.getIp());
-            }
-        } else if (ips != null) {
-            List<GroupServer> servers = gp.getGroupServers();
-            for (GroupServer gs : servers) {
-                if (ips.contains(gs.getIp())) {
-                    _ips.add(gs.getIp());
-                }
-            }
-            if (!_ips.containsAll(ips)) {
-                IdVersion[] key = groupCriteriaQuery.queryByIdAndMode(groupId, SelectionMode.ONLINE_EXCLUSIVE);
-                if (key.length != 0) {
-                    Group online = groupRepository.getByKey(key[0]);
-                    if (online != null && online.getGroupServers() != null) {
-                        for (GroupServer gs : online.getGroupServers()) {
-                            if (ips.contains(gs.getIp())) {
-                                _ips.add(gs.getIp());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return memberOps(request, hh, groupId, _ips, true, TaskOpsType.MEMBER_OPS);
+        return memberOps(request, hh, groupId, ips, batch, true, TaskOpsType.MEMBER_OPS);
     }
 
+    /**
+     * @api {get} /api/op/downMember: [OPS] Mark down member(s)
+     * @apiDescription Mark down group member action will take effect only on a single group. It will set `member` status to 'down' on the specified group.
+     * @apiName MarkDownMember
+     * @apiGroup Operation
+     * @apiParam {Long} groupId         id of the target group whose member needs to be marked down
+     * @apiParam {String} groupName     name of the target group whose member needs to be marked down
+     * @apiParam {String[]} ip        group member ip address(es)
+     * @apiParam {Boolean} batch        if multiple group members needs to be marked down, batch value must be explicitly set to true
+     * @apiSuccess {GroupServerStatusList}   member statuses by group
+     */
     @GET
     @Path("/downMember")
     @Authorize(name = "upDownMember")
@@ -244,7 +238,6 @@ public class OperationResource {
                                @QueryParam("groupName") String groupName,
                                @QueryParam("ip") List<String> ips,
                                @QueryParam("batch") Boolean batch) throws Exception {
-        List<String> _ips = new ArrayList<>();
         if (groupId == null) {
             if (groupName == null) {
                 throw new ValidationException("Group Id or Name not found!");
@@ -253,38 +246,22 @@ public class OperationResource {
             }
         }
 
-        Group gp = groupRepository.getById(groupId);
-        if (null != batch && batch.equals(true)) {
-            List<GroupServer> servers = gp.getGroupServers();
-            for (GroupServer gs : servers) {
-                _ips.add(gs.getIp());
-            }
-        } else if (ips != null) {
-            List<GroupServer> servers = gp.getGroupServers();
-            for (GroupServer gs : servers) {
-                if (ips.contains(gs.getIp())) {
-                    _ips.add(gs.getIp());
-                }
-            }
-            if (!_ips.containsAll(ips)) {
-                IdVersion[] key = groupCriteriaQuery.queryByIdAndMode(groupId, SelectionMode.ONLINE_EXCLUSIVE);
-                if (key.length != 0) {
-                    Group online = groupRepository.getByKey(key[0]);
-                    if (online != null && online.getGroupServers() != null) {
-                        for (GroupServer gs : online.getGroupServers()) {
-                            if (ips.contains(gs.getIp())) {
-                                _ips.add(gs.getIp());
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        batch = batch == null ? false : batch;
 
-        return memberOps(request, hh, groupId, _ips, false, TaskOpsType.MEMBER_OPS);
+        return memberOps(request, hh, groupId, ips, batch, false, TaskOpsType.MEMBER_OPS);
     }
 
-
+    /**
+     * @api {get} /api/op/pullIn: [TARS] Pull in member(s)
+     * @apiDescription Pull in group member action will take effect only on a single group. It will set `pull` status to 'up' on the specified group.
+     * @apiName PullInMember
+     * @apiGroup Operation
+     * @apiParam {Long} groupId         id of the target group whose member needs to be pulled in
+     * @apiParam {String} groupName     name of the target group whose member needs to be pulled in
+     * @apiParam {String[]} ip        group member ip address(es)
+     * @apiParam {Boolean} batch        if multiple group members needs to be pulled in, batch value must be explicitly set to true
+     * @apiSuccess {GroupServerStatusList}   member statuses by group
+     */
     @GET
     @Path("/pullIn")
     @Authorize(name = "upDownMember")
@@ -294,7 +271,6 @@ public class OperationResource {
                            @QueryParam("groupName") String groupName,
                            @QueryParam("ip") List<String> ips,
                            @QueryParam("batch") Boolean batch) throws Exception {
-        List<String> _ips = new ArrayList<>();
         if (groupId == null) {
             if (groupName == null) {
                 throw new ValidationException("Group Id or Name not found!");
@@ -302,36 +278,21 @@ public class OperationResource {
                 groupId = groupCriteriaQuery.queryByName(groupName);
             }
         }
-        Group gp = groupRepository.getById(groupId);
-        if (null != batch && batch.equals(true)) {
-            List<GroupServer> servers = gp.getGroupServers();
-            for (GroupServer gs : servers) {
-                _ips.add(gs.getIp());
-            }
-        } else if (ips != null) {
-            List<GroupServer> servers = gp.getGroupServers();
-            for (GroupServer gs : servers) {
-                if (ips.contains(gs.getIp())) {
-                    _ips.add(gs.getIp());
-                }
-            }
-            if (!_ips.containsAll(ips)) {
-                IdVersion[] key = groupCriteriaQuery.queryByIdAndMode(groupId, SelectionMode.ONLINE_EXCLUSIVE);
-                if (key.length != 0) {
-                    Group online = groupRepository.getByKey(key[0]);
-                    if (online != null && online.getGroupServers() != null) {
-                        for (GroupServer gs : online.getGroupServers()) {
-                            if (ips.contains(gs.getIp())) {
-                                _ips.add(gs.getIp());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return memberOps(request, hh, groupId, _ips, true, TaskOpsType.PULL_MEMBER_OPS);
+        batch = batch == null ? false : batch;
+        return memberOps(request, hh, groupId, ips, batch, true, TaskOpsType.PULL_MEMBER_OPS);
     }
 
+    /**
+     * @api {get} /api/op/pullOut: [TARS] Pull out member(s)
+     * @apiDescription Pull out group member action will take effect only on a single group. It will set `pull` status to 'down' on the specified group.
+     * @apiName PullOutMember
+     * @apiGroup Operation
+     * @apiParam {Long} groupId         id of the target group whose member needs to be pulled out
+     * @apiParam {String} groupName     name of the target group whose member needs to be pulled out
+     * @apiParam {String[]} ip        group member ip address(es)
+     * @apiParam {Boolean} batch        if multiple group members needs to be pulled out, batch value must be explicitly set to true
+     * @apiSuccess {GroupServerStatusList}   member statuses by group
+     */
     @GET
     @Path("/pullOut")
     @Authorize(name = "upDownMember")
@@ -341,7 +302,6 @@ public class OperationResource {
                             @QueryParam("groupName") String groupName,
                             @QueryParam("ip") List<String> ips,
                             @QueryParam("batch") Boolean batch) throws Exception {
-        List<String> _ips = new ArrayList<>();
         if (groupId == null) {
             if (groupName == null) {
                 throw new ValidationException("Group Id or Name not found!");
@@ -349,36 +309,21 @@ public class OperationResource {
                 groupId = groupCriteriaQuery.queryByName(groupName);
             }
         }
-        Group gp = groupRepository.getById(groupId);
-        if (null != batch && batch.equals(true)) {
-            List<GroupServer> servers = gp.getGroupServers();
-            for (GroupServer gs : servers) {
-                _ips.add(gs.getIp());
-            }
-        } else if (ips != null) {
-            List<GroupServer> servers = gp.getGroupServers();
-            for (GroupServer gs : servers) {
-                if (ips.contains(gs.getIp())) {
-                    _ips.add(gs.getIp());
-                }
-            }
-            if (!_ips.containsAll(ips)) {
-                IdVersion[] key = groupCriteriaQuery.queryByIdAndMode(groupId, SelectionMode.ONLINE_EXCLUSIVE);
-                if (key.length != 0) {
-                    Group online = groupRepository.getByKey(key[0]);
-                    if (online != null && online.getGroupServers() != null) {
-                        for (GroupServer gs : online.getGroupServers()) {
-                            if (ips.contains(gs.getIp())) {
-                                _ips.add(gs.getIp());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return memberOps(request, hh, groupId, _ips, false, TaskOpsType.PULL_MEMBER_OPS);
+        batch = batch == null ? false : batch;
+        return memberOps(request, hh, groupId, ips, batch, false, TaskOpsType.PULL_MEMBER_OPS);
     }
 
+    /**
+     * @api {get} /api/op/raise: [HC] Raise member(s)
+     * @apiDescription Raise group member action will take effect only on a single group. It will set `healthy` status to 'up' on the specified group.
+     * @apiName RaiseMember
+     * @apiGroup Operation
+     * @apiParam {Long} groupId         id of the target group whose member needs to be pulled out
+     * @apiParam {String} groupName     name of the target group whose member needs to be pulled out
+     * @apiParam {String[]} ip        group member ip address(es)
+     * @apiParam {Boolean} batch        if multiple group members needs to be pulled out, batch value must be explicitly set to true
+     * @apiSuccess {GroupServerStatusList}   member statuses by group
+     */
     @GET
     @Path("/raise")
     @Authorize(name = "upDownMember")
@@ -388,7 +333,6 @@ public class OperationResource {
                           @QueryParam("groupName") String groupName,
                           @QueryParam("ip") List<String> ips,
                           @QueryParam("batch") Boolean batch) throws Exception {
-        List<String> _ips = new ArrayList<>();
         if (groupId == null) {
             if (groupName == null) {
                 throw new ValidationException("Group Id or Name not found!");
@@ -400,43 +344,26 @@ public class OperationResource {
         if (gp == null) {
             throw new ValidationException("Group Id or Name not found!");
         }
-        if (null != batch && batch.equals(true)) {
-            List<GroupServer> servers = gp.getGroupServers();
-            for (GroupServer gs : servers) {
-                _ips.add(gs.getIp());
-            }
-        } else if (ips != null) {
-            List<GroupServer> servers = gp.getGroupServers();
-            for (GroupServer gs : servers) {
-                if (ips.contains(gs.getIp())) {
-                    _ips.add(gs.getIp());
-                }
-            }
-            if (!_ips.containsAll(ips)) {
-                IdVersion[] key = groupCriteriaQuery.queryByIdAndMode(groupId, SelectionMode.ONLINE_EXCLUSIVE);
-                if (key.length != 0) {
-                    Group online = groupRepository.getByKey(key[0]);
-                    if (online != null && online.getGroupServers() != null) {
-                        for (GroupServer gs : online.getGroupServers()) {
-                            if (ips.contains(gs.getIp())) {
-                                _ips.add(gs.getIp());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if (_ips.size() == 0) {
-            throw new ValidationException("Not found ip in group.GroupId:" + groupId + " ip:" + ips.toString());
-        }
 
+        batch = batch == null ? false : batch;
         if (healthyOpsActivate.get()) {
-            return memberOps(request, hh, groupId, _ips, true, TaskOpsType.HEALTHY_OPS);
+            return memberOps(request, hh, groupId, ips, batch, true, TaskOpsType.HEALTHY_OPS);
         } else {
-            return healthyOps(hh, groupId, _ips, true);
+            return healthyOps(hh, groupId, ips, true);
         }
     }
 
+    /**
+     * @api {get} /api/op/fall: [HC] Fall member(s)
+     * @apiDescription Fall group member action will take effect only on a single group. It will set `healthy` status to 'down' on the specified group.
+     * @apiName FallMember
+     * @apiGroup Operation
+     * @apiParam {Long} groupId         id of the target group whose member needs to be pulled out
+     * @apiParam {String} groupName     name of the target group whose member needs to be pulled out
+     * @apiParam {String[]} ip        group member ip address(es)
+     * @apiParam {Boolean} batch        if multiple group members needs to be pulled out, batch value must be explicitly set to true
+     * @apiSuccess {GroupServerStatusList}   member statuses by group
+     */
     @GET
     @Path("/fall")
     @Authorize(name = "upDownMember")
@@ -446,7 +373,6 @@ public class OperationResource {
                          @QueryParam("groupName") String groupName,
                          @QueryParam("ip") List<String> ips,
                          @QueryParam("batch") Boolean batch) throws Exception {
-        List<String> _ips = new ArrayList<>();
         if (groupId == null) {
             if (groupName == null) {
                 throw new ValidationException("Group Id or Name not found!");
@@ -454,45 +380,27 @@ public class OperationResource {
                 groupId = groupCriteriaQuery.queryByName(groupName);
             }
         }
-        Group gp = groupRepository.getById(groupId);
-        if (gp == null) {
-            throw new ValidationException("Group Id or Name not found!");
-        }
-        if (null != batch && batch.equals(true)) {
-
-            List<GroupServer> servers = gp.getGroupServers();
-            for (GroupServer gs : servers) {
-                _ips.add(gs.getIp());
-            }
-        } else if (ips != null) {
-            List<GroupServer> servers = gp.getGroupServers();
-            for (GroupServer gs : servers) {
-                if (ips.contains(gs.getIp())) {
-                    _ips.add(gs.getIp());
-                }
-            }
-            if (!_ips.containsAll(ips)) {
-                IdVersion[] key = groupCriteriaQuery.queryByIdAndMode(groupId, SelectionMode.ONLINE_EXCLUSIVE);
-                if (key.length != 0) {
-                    Group online = groupRepository.getByKey(key[0]);
-                    if (online != null && online.getGroupServers() != null) {
-                        for (GroupServer gs : online.getGroupServers()) {
-                            if (ips.contains(gs.getIp())) {
-                                _ips.add(gs.getIp());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if (_ips.size() == 0) {
-            throw new ValidationException("Not found ip in group.GroupId:" + groupId + " ip:" + ips.toString());
-        }
+        batch = batch == null ? false : batch;
         if (healthyOpsActivate.get()) {
-            return memberOps(request, hh, groupId, _ips, false, TaskOpsType.HEALTHY_OPS);
+            return memberOps(request, hh, groupId, ips, batch, false, TaskOpsType.HEALTHY_OPS);
         } else {
-            return healthyOps(hh, groupId, _ips, false);
+            return healthyOps(hh, groupId, ips, false);
         }
+    }
+
+    @POST
+    @Path("/uploadcerts")
+    @Consumes(MediaType.MULTIPART_FORM_DATA)
+    @Authorize(name = "uploadCerts")
+    @Deprecated
+    public void uploadCertAlias(@Context HttpServletRequest request,
+                                @Context HttpServletResponse response,
+                                @Context HttpHeaders hh,
+                                @FormDataParam("cert") InputStream cert,
+                                @FormDataParam("key") InputStream key,
+                                @QueryParam("domain") String domain) throws Exception {
+        RequestDispatcher dispatcher = request.getServletContext().getRequestDispatcher("/api/cert/upload");
+        dispatcher.forward(request, response);
     }
 
     private Response healthyOps(HttpHeaders hh, Long groupId, List<String> ips, boolean b) throws Exception {
@@ -500,162 +408,78 @@ public class OperationResource {
         return responseHandler.handle(groupStatusService.getOfflineGroupStatus(groupId), hh.getMediaType());
     }
 
-    @POST
-    @Path("/uploadcerts")
-    @Consumes(MediaType.MULTIPART_FORM_DATA)
-    @Authorize(name = "uploadCerts")
-    public Response uploadCerts(@Context HttpServletRequest request,
-                                @Context HttpHeaders hh,
-                                @FormDataParam("cert") InputStream cert,
-                                @FormDataParam("key") InputStream key,
-                                @QueryParam("domain") String domain) throws Exception {
-        if (domain == null || domain.isEmpty()) {
-            throw new ValidationException("Domain info is required.");
+    private Response memberOps(HttpServletRequest request, HttpHeaders hh, Long groupId, List<String> memberIps, boolean batch, boolean up, String type) throws Exception {
+
+        ModelStatusMapping<Group> groupMap = entityFactory.getGroupsByIds(new Long[]{groupId});
+        if (groupMap.getOfflineMapping() == null || groupMap.getOfflineMapping().size() == 0) {
+            throw new ValidationException("Not Found Group By Id.");
         }
-        String[] domainMembers = domain.split("\\|");
-        Arrays.sort(domainMembers);
-        domain = Joiner.on("|").join(domainMembers);
 
-        certificateService.upload(cert, key, domain, CertificateConfig.ONBOARD);
-        return responseHandler.handle("Certificates uploaded. Virtual server creation is permitted.", hh.getMediaType());
-    }
-
-    @POST
-    @Path("/upgradecerts")
-    @Consumes(MediaType.MULTIPART_FORM_DATA)
-    @Authorize(name = "upgradeCerts")
-    public Response upgradeCerts(@Context HttpServletRequest request,
-                                 @Context HttpHeaders hh,
-                                 @FormDataParam("cert") InputStream cert,
-                                 @FormDataParam("key") InputStream key,
-                                 @QueryParam("domain") String domain,
-                                 @QueryParam("vsId") Long vsId,
-                                 @QueryParam("ip") List<String> ips) throws Exception {
-        if (domain == null || domain.isEmpty()) {
-            throw new ValidationException("Domain info is required.");
+        Set<String> groupMemberIps = new HashSet<>();
+        for (GroupServer gs : groupMap.getOfflineMapping().get(groupId).getGroupServers()) {
+            groupMemberIps.add(gs.getIp());
         }
-        if (vsId == null) {
-            throw new ValidationException("vsId is required when updating certificate.");
-        }
-        // update certificate or run grayscale test
-        IdVersion[] check = virtualServerCriteriaQuery.queryByIdAndMode(vsId, SelectionMode.REDUNDANT);
-        Set<IdVersion> keys = virtualServerCriteriaQuery.queryByDomain(domain);
-        keys.retainAll(Sets.newHashSet(check));
-        if (keys.size() == 0) {
-            throw new ValidationException("VsId and domain mismatched.");
-        }
-        configureIps(keys.toArray(new IdVersion[keys.size()]), ips);
-
-        String[] domainMembers = domain.split("\\|");
-        Arrays.sort(domainMembers);
-        domain = Joiner.on("|").join(domainMembers);
-        Long certId = certificateService.upgrade(cert, key, domain, CertificateConfig.ONBOARD);
-        return responseHandler.handle("Certificate uploaded. New cert-id is " + certId + ". Contact slb team with the given cert-id to install the new certificate.", hh.getMediaType());
-//        certificateService.command(vsId, ips, certId);
-//        certificateService.install(vsId);
-//        return responseHandler.handle("Certificates uploaded. Re-activate the virtual server to take effect.", hh.getMediaType());
-    }
-
-    @GET
-    @Path("/dropcerts")
-    @Authorize(name = "dropCerts")
-    public Response dropCerts(@Context HttpServletRequest request,
-                              @Context HttpHeaders hh,
-                              @QueryParam("vsId") Long vsId,
-                              @QueryParam("ip") List<String> ips) throws Exception {
-        return responseHandler.handle("dropcerts is not available at the moment.", hh.getMediaType());
-//        if (vsId == null && (ips == null || ips.size() == 0))
-//            throw new ValidationException("vsId and ip addresses are required.");
-//        certificateService.recall(vsId, ips);
-//        certificateService.uninstallIfRecalled(vsId);
-//        return responseHandler.handle("Certificates dropped successfully. Re-activate the virtual server to take effect.", hh.getMediaType());
-    }
-
-    @GET
-    @Path("/cert/remoteInstall")
-    @Authorize(name = "remoteInstallCerts")
-    public Response remoteInstall(@Context HttpServletRequest request,
-                                  @Context HttpHeaders hh,
-                                  @QueryParam("certId") Long certId,
-                                  @QueryParam("vsId") Long vsId,
-                                  @QueryParam("ips") List<String> ips) throws Exception {
-        if (certId == null || ips == null || vsId == null) {
-            throw new ValidationException("certId, vsId and ips are required.");
-        }
-        IdVersion[] keys = virtualServerCriteriaQuery.queryByIdAndMode(vsId, SelectionMode.REDUNDANT);
-        ips = configureIps(keys, ips);
-        certificateService.install(vsId, ips, certId);
-        return responseHandler.handle("Certificates uploaded. Re-activate the virtual server to take effect.", hh.getMediaType());
-    }
-
-    @GET
-    @Path("/installcerts")
-    @Authorize(name = "installCerts")
-    public Response installCerts(@Context HttpServletRequest request,
-                                 @Context HttpHeaders hh,
-                                 @QueryParam("vsId") Long vsId,
-                                 @QueryParam("certId") Long certId) throws Exception {
-        if (vsId == null || certId == null)
-            throw new ValidationException("vsId and certId are required.");
-        String domain = certificateInstaller.localInstall(vsId, certId);
-        return responseHandler.handle("Certificates with domain " + domain + " are installed successfully.", hh.getMediaType());
-    }
-
-    @GET
-    @Path("/cert/batchInstall")
-    public Response batchInstall(@Context HttpServletRequest request,
-                                 @Context HttpHeaders hh,
-                                 @QueryParam("slbId") Long slbId) throws Exception {
-        if (slbId == null) {
-            throw new ValidationException("slbId is required.");
-        }
-        certificateInstaller.localBatchInstall(slbId);
-        return responseHandler.handle("Certificates are installed successfully.", hh.getMediaType());
-    }
-
-    @GET
-    @Path("/uninstallcerts")
-    @Authorize(name = "uninstallCerts")
-    public Response uninstallCerts(@Context HttpServletRequest request,
-                                   @Context HttpHeaders hh,
-                                   @QueryParam("vsId") Long vsId) throws Exception {
-        if (vsId == null)
-            throw new ValidationException("vsId and certId are required.");
-        certificateInstaller.localUninstall(vsId);
-        return responseHandler.handle("Certificates for vsId " + vsId + " are uninstalled.", hh.getMediaType());
-    }
-
-    private Response memberOps(HttpServletRequest request, HttpHeaders hh, Long groupId, List<String> ips, boolean up, String type) throws Exception {
-        Map<String, List<Boolean>> status = statusService.fetchGroupServerStatus(new Long[]{groupId});
-        boolean skipOps = true;
-        for (String ip : ips) {
-            int index = 0;
-            if (type.equals(TaskOpsType.HEALTHY_OPS)) index = StatusOffset.HEALTHY;
-            if (type.equals(TaskOpsType.PULL_MEMBER_OPS)) index = StatusOffset.PULL_OPS;
-            if (type.equals(TaskOpsType.MEMBER_OPS)) index = StatusOffset.MEMBER_OPS;
-            boolean preStatus = status.get(groupId.toString() + "_" + ip).get(index);
-            if (preStatus != up) {
-                skipOps = false;
+        if (groupMap.getOnlineMapping().get(groupId) != null) {
+            for (GroupServer gs : groupMap.getOnlineMapping().get(groupId).getGroupServers()) {
+                groupMemberIps.add(gs.getIp());
             }
         }
+
+        List<String> ips = new ArrayList<>();
+        if (batch) {
+            Group gp = groupMap.getOfflineMapping().get(groupId);
+            List<GroupServer> servers = gp.getGroupServers();
+            for (GroupServer gs : servers) {
+                ips.add(gs.getIp());
+            }
+        } else if (memberIps != null && memberIps.size() > 0) {
+            for (String ip : memberIps) {
+                if (groupMemberIps.contains(ip)) {
+                    ips.add(ip);
+                }
+            }
+        }
+        if (ips.size() == 0) {
+            throw new ValidationException("Ip Param Is Null Or Invalidate Ip Param.");
+        }
+
+        List<GroupStatus> statuses = groupStatusService.getOfflineGroupsStatus(groupMap);
+        GroupStatus status = null;
+        if (statuses.size() > 0) {
+            status = statuses.get(0);
+        }
+
+        boolean skipOps = false;
+        if (status != null) {
+            skipOps = true;
+            for (GroupServerStatus gss : status.getGroupServerStatuses()) {
+                if (ips.contains(gss.getIp())) {
+                    if (type.equals(TaskOpsType.HEALTHY_OPS) && gss.getHealthy() != up) {
+                        skipOps = false;
+                    } else if (type.equals(TaskOpsType.PULL_MEMBER_OPS) && gss.getPull() != up) {
+                        skipOps = false;
+                    } else if (type.equals(TaskOpsType.MEMBER_OPS) && gss.getMember() != up) {
+                        skipOps = false;
+                    }
+                }
+            }
+        }
+
         if (skipOps) {
             GroupStatus groupStatus = groupStatusService.getOfflineGroupStatus(groupId);
             logger.info("Group status equals the desired value.Do not need execute task.GroupId:" + groupId + " ips:"
                     + ips.toString() + " up:" + up + " type:" + type);
             return responseHandler.handle(groupStatus, hh.getMediaType());
         }
+
         StringBuilder sb = new StringBuilder();
         for (String ip : ips) {
             sb.append(ip).append(";");
         }
-        ModelStatusMapping<Group> mapping = entityFactory.getGroupsByIds(new Long[]{groupId});
-        if (mapping.getOfflineMapping() == null || mapping.getOfflineMapping().size() == 0) {
-            throw new ValidationException("Not Found Group By Id.");
-        }
-        Group onlineGroup = mapping.getOnlineMapping().get(groupId);
-        Group offlineGroup = mapping.getOfflineMapping().get(groupId);
+
+        Group onlineGroup = groupMap.getOnlineMapping().get(groupId);
+        Group offlineGroup = groupMap.getOfflineMapping().get(groupId);
         Set<Long> vsIds = new HashSet<>();
-        Set<Long> slbIds = new HashSet<>();
         if (onlineGroup != null) {
             for (GroupVirtualServer gvs : onlineGroup.getGroupVirtualServers()) {
                 vsIds.add(gvs.getVirtualServer().getId());
@@ -665,25 +489,8 @@ public class OperationResource {
             vsIds.add(gvs.getVirtualServer().getId());
         }
 
-        ModelStatusMapping<VirtualServer> vsMaping = entityFactory.getVsesByIds(vsIds.toArray(new Long[]{}));
-
-        VirtualServer tmp;
-        for (Long vsId : vsIds) {
-            tmp = vsMaping.getOnlineMapping().get(vsId);
-            if (tmp == null) {
-                tmp = vsMaping.getOfflineMapping().get(vsId);
-            }
-            slbIds.addAll(tmp.getSlbIds());
-        }
-        //TODO flag for Healthy ops
-        if (type.equals(TaskOpsType.HEALTHY_OPS)) {
-            for (Long slbId : slbIds) {
-                if (!configHandler.getEnable("healthy.operation.active", slbId, null, null, false)) {
-                    logger.info("healthy.operation.active is false. slbId:" + slbId);
-                    return healthyOps(hh, groupId, ips, up);
-                }
-            }
-        }
+        Set<IdVersion> vsIdVersions = virtualServerCriteriaQuery.queryByIdsAndMode(vsIds.toArray(new Long[]{}), SelectionMode.ONLINE_FIRST);
+        Set<Long> slbIds = slbCriteriaQuery.queryByVses(vsIdVersions.toArray(new IdVersion[]{}));
 
         List<OpsTask> tasks = new ArrayList<>();
         for (Long slbId : slbIds) {
@@ -703,81 +510,160 @@ public class OperationResource {
             }
         }
         GroupStatus groupStatus = groupStatusService.getOfflineGroupStatus(groupId);
-        addHealthyProperty(groupStatus);
 
         String slbMessageData = MessageUtil.getMessageData(request, new Group[]{offlineGroup}, null, null, ips.toArray(new String[ips.size()]), true);
         if (configHandler.getEnable("use.new,message.queue.producer", false)) {
-            messageQueueService.produceMessage(request.getRequestURI(), groupId, slbMessageData);
+            messageQueue.produceMessage(request.getRequestURI(), groupId, slbMessageData);
         } else {
             if (type.equals(TaskOpsType.HEALTHY_OPS)) {
-                messageQueueService.produceMessage(MessageType.OpsHealthy, groupId, slbMessageData);
+                messageQueue.produceMessage(MessageType.OpsHealthy, groupId, slbMessageData);
             } else if (type.equals(TaskOpsType.PULL_MEMBER_OPS)) {
-                messageQueueService.produceMessage(MessageType.OpsPull, groupId, slbMessageData);
+                messageQueue.produceMessage(MessageType.OpsPull, groupId, slbMessageData);
             } else if (type.equals(TaskOpsType.MEMBER_OPS)) {
-                messageQueueService.produceMessage(MessageType.OpsMember, groupId, slbMessageData);
+                messageQueue.produceMessage(MessageType.OpsMember, groupId, slbMessageData);
             }
         }
-
-
         return responseHandler.handle(groupStatus, hh.getMediaType());
     }
 
-    private List<String> configureIps(IdVersion[] keys, List<String> ips) throws Exception {
-        Set<Long> slbId = slbCriteriaQuery.queryByVses(keys);
-        ModelStatusMapping<Slb> check = entityFactory.getSlbsByIds(slbId.toArray(new Long[slbId.size()]));
-        if (check.getOfflineMapping().size() == 0 && check.getOnlineMapping().size() == 0) {
-            throw new ValidationException("Cannot find slb servers by the given vsId.");
-        }
-        Set<String> slbIps = new HashSet<>();
-        for (Slb slb : check.getOfflineMapping().values()) {
-            for (SlbServer server : slb.getSlbServers()) {
-                slbIps.add(server.getIp());
-            }
-        }
-        for (Slb slb : check.getOnlineMapping().values()) {
-            for (SlbServer slbServer : slb.getSlbServers()) {
-                slbIps.add(slbServer.getIp());
-            }
-        }
-        if (ips != null && ips.size() > 0) {
-            if (!slbIps.containsAll(ips)) {
-                throw new ValidationException("Some ips do not belong to the current slb.");
-            }
-        } else {
-            ips = new ArrayList<>(slbIps);
-        }
-        return ips;
-    }
-
-    private void addHealthyProperty(GroupStatus gs) throws Exception {
-        boolean health = true;
-        boolean unhealth = true;
-        for (GroupServerStatus gss : gs.getGroupServerStatuses()) {
-            if (gss.getServer() && gss.getHealthy() && gss.getPull() && gss.getMember()) {
-                unhealth = false;
-            } else {
-                health = false;
-            }
-        }
-        if (health) {
-            propertyBox.set("healthy", "health", "group", gs.getGroupId());
-        } else if (unhealth) {
-            propertyBox.set("healthy", "unhealth", "group", gs.getGroupId());
-        } else {
-            propertyBox.set("healthy", "sub-health", "group", gs.getGroupId());
-        }
-    }
-
     @GET
-    @Path("/health/fillData")
-    public Response healthFillData(@Context HttpServletRequest request,
-                                   @Context HttpHeaders hh) throws Exception {
-        List<GroupStatus> list = groupStatusService.getAllOfflineGroupsStatus();
-        for (GroupStatus gs : list) {
-            addHealthyProperty(gs);
+    @Path("/fillStatusData")
+    public Response fillData(@Context HttpServletRequest request,
+                             @Context HttpHeaders hh) throws Exception {
+        List<GroupStatus> gses = groupStatusService.getAllOfflineGroupsStatus();
+
+        HashSet<Long> upHealthy = new HashSet<>();
+        HashSet<Long> upUnhealthy = new HashSet<>();
+        HashSet<Long> upBroken = new HashSet<>();
+        HashSet<Long> healthHealthy = new HashSet<>();
+        HashSet<Long> healthUnhealthy = new HashSet<>();
+        HashSet<Long> healthBroken = new HashSet<>();
+        HashSet<Long> pullInHealthy = new HashSet<>();
+        HashSet<Long> pullInUnhealthy = new HashSet<>();
+        HashSet<Long> pullInBroken = new HashSet<>();
+        HashSet<Long> memberUpHealthy = new HashSet<>();
+        HashSet<Long> memberUpUnhealthy = new HashSet<>();
+        HashSet<Long> memberUpBroken = new HashSet<>();
+        HashSet<Long> serverUpHealthy = new HashSet<>();
+        HashSet<Long> serverUpUnhealthy = new HashSet<>();
+        HashSet<Long> serverUpBroken = new HashSet<>();
+
+
+        for (GroupStatus gs : gses) {
+            int upCount = 0;
+            int healthCount = 0;
+            int pullInCount = 0;
+            int memberUpCount = 0;
+            int serverUpCount = 0;
+            int allServerCount = gs.getGroupServerStatuses().size();
+
+            for (GroupServerStatus gss : gs.getGroupServerStatuses()) {
+                if (gss.getServer() && gss.getHealthy() && gss.getPull() && gss.getMember()) {
+                    upCount += 1;
+                    serverUpCount += 1;
+                    healthCount += 1;
+                    pullInCount += 1;
+                    memberUpCount += 1;
+                    continue;
+                }
+                if (gss.getServer()) {
+                    serverUpCount += 1;
+                }
+                if (gss.getHealthy()) {
+                    healthCount += 1;
+                }
+                if (gss.getPull()) {
+                    pullInCount += 1;
+                }
+                if (gss.getMember()) {
+                    memberUpCount += 1;
+                }
+            }
+            if (upCount == allServerCount) {
+                upHealthy.add(gs.getGroupId());
+            } else if (upCount == 0) {
+                upBroken.add(gs.getGroupId());
+            } else {
+                upUnhealthy.add(gs.getGroupId());
+            }
+
+            if (serverUpCount == allServerCount) {
+                serverUpHealthy.add(gs.getGroupId());
+            } else if (serverUpCount == 0) {
+                serverUpBroken.add(gs.getGroupId());
+            } else {
+                serverUpUnhealthy.add(gs.getGroupId());
+            }
+            if (memberUpCount == allServerCount) {
+                memberUpHealthy.add(gs.getGroupId());
+            } else if (memberUpCount == 0) {
+                memberUpBroken.add(gs.getGroupId());
+            } else {
+                memberUpUnhealthy.add(gs.getGroupId());
+            }
+            if (pullInCount == allServerCount) {
+                pullInHealthy.add(gs.getGroupId());
+            } else if (pullInCount == 0) {
+                pullInBroken.add(gs.getGroupId());
+            } else {
+                pullInUnhealthy.add(gs.getGroupId());
+            }
+            if (healthCount == allServerCount) {
+                healthHealthy.add(gs.getGroupId());
+            } else if (healthCount == 0) {
+                healthBroken.add(gs.getGroupId());
+            } else {
+                healthUnhealthy.add(gs.getGroupId());
+            }
         }
-        return responseHandler.handle("Fill Data Success.", hh.getMediaType());
+        if (healthBroken.size() > 0) {
+            propertyBox.set("healthCheckHealthy", "broken", "group", healthBroken.toArray(new Long[]{}));
+        }
+        if (healthHealthy.size() > 0) {
+            propertyBox.set("healthCheckHealthy", "healthy", "group", healthHealthy.toArray(new Long[]{}));
+        }
+        if (healthUnhealthy.size() > 0) {
+            propertyBox.set("healthCheckHealthy", "unhealthy", "group", healthUnhealthy.toArray(new Long[]{}));
+        }
+        if (pullInBroken.size() > 0) {
+            propertyBox.set("pullHealthy", "broken", "group", pullInBroken.toArray(new Long[]{}));
+        }
+        if (pullInHealthy.size() > 0) {
+            propertyBox.set("pullHealthy", "healthy", "group", pullInHealthy.toArray(new Long[]{}));
+        }
+        if (pullInUnhealthy.size() > 0) {
+            propertyBox.set("pullHealthy", "unhealthy", "group", pullInUnhealthy.toArray(new Long[]{}));
+        }
+        if (memberUpBroken.size() > 0) {
+            propertyBox.set("memberHealthy", "broken", "group", memberUpBroken.toArray(new Long[]{}));
+        }
+        if (memberUpHealthy.size() > 0) {
+            propertyBox.set("memberHealthy", "healthy", "group", memberUpHealthy.toArray(new Long[]{}));
+        }
+        if (memberUpUnhealthy.size() > 0) {
+            propertyBox.set("memberHealthy", "unhealthy", "group", memberUpUnhealthy.toArray(new Long[]{}));
+        }
+        if (serverUpBroken.size() > 0) {
+            propertyBox.set("serverHealthy", "broken", "group", serverUpBroken.toArray(new Long[]{}));
+        }
+        if (serverUpHealthy.size() > 0) {
+            propertyBox.set("serverHealthy", "healthy", "group", serverUpHealthy.toArray(new Long[]{}));
+        }
+        if (serverUpUnhealthy.size() > 0) {
+            propertyBox.set("serverHealthy", "unhealthy", "group", serverUpUnhealthy.toArray(new Long[]{}));
+        }
+        if (upBroken.size() > 0) {
+            propertyBox.set("healthy", "broken", "group", upBroken.toArray(new Long[]{}));
+        }
+        if (upHealthy.size() > 0) {
+            propertyBox.set("healthy", "healthy", "group", upHealthy.toArray(new Long[]{}));
+        }
+        if (upUnhealthy.size() > 0) {
+            propertyBox.set("healthy", "unhealthy", "group", upUnhealthy.toArray(new Long[]{}));
+        }
+        return responseHandler.handle("Success.", hh.getMediaType());
     }
 
 }
+
 

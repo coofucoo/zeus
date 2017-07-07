@@ -7,6 +7,7 @@ import com.ctrip.zeus.model.entity.LoadBalancingMethod;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonView;
 
+import java.util.Date;
 import java.util.List;
 
 /**
@@ -28,14 +29,17 @@ public abstract class GroupView {
     @JsonView(ViewConstraints.Normal.class)
     abstract Integer getVersion();
 
-    @JsonView(ViewConstraints.Normal.class)
+    @JsonView(ViewConstraints.Detail.class)
     abstract HealthCheck getHealthCheck();
 
-    @JsonView(ViewConstraints.Normal.class)
+    @JsonView(ViewConstraints.Detail.class)
     abstract LoadBalancingMethod getLoadBalancingMethod();
 
     @JsonView(ViewConstraints.Normal.class)
     abstract List<GroupServer> getGroupServers();
+
+    @JsonView(ViewConstraints.Normal.class)
+    abstract Date getCreatedTime();
 
     @JsonView(ViewConstraints.Detail.class)
     abstract List<GroupVirtualServer> getGroupVirtualServers();

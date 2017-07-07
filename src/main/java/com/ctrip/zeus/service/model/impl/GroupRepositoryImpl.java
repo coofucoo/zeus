@@ -6,10 +6,11 @@ import com.ctrip.zeus.dal.core.ArchiveGroupEntity;
 import com.ctrip.zeus.exceptions.ValidationException;
 import com.ctrip.zeus.model.entity.*;
 import com.ctrip.zeus.service.model.*;
+import com.ctrip.zeus.service.model.common.ValidationContext;
 import com.ctrip.zeus.service.model.handler.GroupSync;
-import com.ctrip.zeus.service.model.handler.GroupValidator;
-import com.ctrip.zeus.service.model.handler.VGroupValidator;
+import com.ctrip.zeus.service.model.validation.GroupValidator;
 import com.ctrip.zeus.service.model.handler.impl.ContentReaders;
+import com.ctrip.zeus.service.model.ValidationFacade;
 import com.ctrip.zeus.service.query.GroupCriteriaQuery;
 import com.ctrip.zeus.service.query.VirtualServerCriteriaQuery;
 import com.ctrip.zeus.service.status.StatusService;
@@ -39,7 +40,7 @@ public class GroupRepositoryImpl implements GroupRepository {
     @Resource
     private GroupValidator groupModelValidator;
     @Resource
-    private VGroupValidator vGroupValidator;
+    private ValidationFacade validationFacade;
     @Resource
     private StatusService statusService;
     @Resource
@@ -55,6 +56,11 @@ public class GroupRepositoryImpl implements GroupRepository {
 
     @Override
     public List<Group> list(IdVersion[] keys) throws Exception {
+        return list(keys, new RepositoryContext(false, SelectionMode.OFFLINE_FIRST));
+    }
+
+    @Override
+    public List<Group> list(IdVersion[] keys, RepositoryContext repositoryContext) throws Exception {
         List<Group> result = new ArrayList<>();
         Integer[] hashes = new Integer[keys.length];
         String[] values = new String[keys.length];
@@ -63,33 +69,32 @@ public class GroupRepositoryImpl implements GroupRepository {
             values[i] = keys[i].toString();
         }
         for (ArchiveGroupDo d : archiveGroupDao.findAllByIdVersion(hashes, values, ArchiveGroupEntity.READSET_FULL)) {
-            Group group = ContentReaders.readGroupContent(d.getContent());
-            result.add(group);
-        }
-
-        Set<Long> vsIds = new HashSet<>();
-        for (Group group : result) {
-            for (GroupVirtualServer groupVirtualServer : group.getGroupVirtualServers()) {
-                vsIds.add(groupVirtualServer.getVirtualServer().getId());
+            try {
+                Group group = ContentReaders.readGroupContent(d.getContent());
+                group.setCreatedTime(d.getDataChangeLastTime());
+                result.add(group);
+            } catch (Exception e) {
             }
         }
-        Set<IdVersion> vsKeys = virtualServerCriteriaQuery.queryByIdsAndMode(vsIds.toArray(new Long[vsIds.size()]), SelectionMode.ONLINE_FIRST);
-        Map<Long, VirtualServer> map = Maps.uniqueIndex(
-                virtualServerRepository.listAll(vsKeys.toArray(new IdVersion[vsKeys.size()])),
-                new Function<VirtualServer, Long>() {
-                    @Nullable
-                    @Override
-                    public Long apply(@Nullable VirtualServer virtualServer) {
-                        return virtualServer.getId();
-                    }
-                });
 
         for (Group group : result) {
-            for (GroupVirtualServer groupVirtualServer : group.getGroupVirtualServers()) {
-                groupVirtualServer.setVirtualServer(map.get(groupVirtualServer.getVirtualServer().getId()));
-            }
-            autoFiller.autofillEmptyFields(group);
+            autoFiller.autofill(group);
             hideVirtualValue(group);
+        }
+
+        if (!repositoryContext.isLite()) {
+            Set<Long> vsIds = new HashSet<>();
+            for (Group group : result) {
+                for (GroupVirtualServer groupVirtualServer : group.getGroupVirtualServers()) {
+                    vsIds.add(groupVirtualServer.getVirtualServer().getId());
+                }
+            }
+            Map<Long, VirtualServer> map = buildVsMapping(vsIds.toArray(new Long[vsIds.size()]), repositoryContext.getSelectionMode());
+            for (Group group : result) {
+                for (GroupVirtualServer groupVirtualServer : group.getGroupVirtualServers()) {
+                    groupVirtualServer.setVirtualServer(map.get(groupVirtualServer.getVirtualServer().getId()));
+                }
+            }
         }
         return result;
     }
@@ -104,30 +109,51 @@ public class GroupRepositoryImpl implements GroupRepository {
 
     @Override
     public Group getByKey(IdVersion key) throws Exception {
-        if (groupModelValidator.exists(key.getId()) || vGroupValidator.exists(key.getId())) {
-            ArchiveGroupDo d = archiveGroupDao.findByGroupAndVersion(key.getId(), key.getVersion(), ArchiveGroupEntity.READSET_FULL);
-            if (d == null) return null;
-            Group result = ContentReaders.readGroupContent(d.getContent());
-            for (GroupVirtualServer groupVirtualServer : result.getGroupVirtualServers()) {
-                IdVersion[] vsKey = virtualServerCriteriaQuery.queryByIdAndMode(groupVirtualServer.getVirtualServer().getId(), SelectionMode.ONLINE_FIRST);
-                groupVirtualServer.setVirtualServer(virtualServerRepository.getByKey(vsKey[0]));
+        return getByKey(key, new RepositoryContext(false, SelectionMode.OFFLINE_FIRST));
+    }
+
+    @Override
+    public Group getByKey(IdVersion key, RepositoryContext repositoryContext) throws Exception {
+        ArchiveGroupDo d = archiveGroupDao.findByGroupAndVersion(key.getId(), key.getVersion(), ArchiveGroupEntity.READSET_FULL);
+        if (d == null) return null;
+
+        Group result = ContentReaders.readGroupContent(d.getContent());
+        autoFiller.autofill(result);
+        hideVirtualValue(result);
+
+        if (!repositoryContext.isLite()) {
+            Set<Long> vsIds = new HashSet<>();
+            for (GroupVirtualServer e : result.getGroupVirtualServers()) {
+                vsIds.add(e.getVirtualServer().getId());
             }
-            autoFiller.autofill(result);
-            hideVirtualValue(result);
-            return result;
+            Map<Long, VirtualServer> map = buildVsMapping(vsIds.toArray(new Long[vsIds.size()]), repositoryContext.getSelectionMode());
+
+            for (GroupVirtualServer e : result.getGroupVirtualServers()) {
+                e.setVirtualServer(map.get(e.getVirtualServer().getId()));
+            }
         }
-        return null;
+
+        result.setCreatedTime(d.getDataChangeLastTime());
+        return result;
     }
 
     @Override
     public Group add(Group group, boolean escapedPathValidation) throws Exception {
         group.setId(0L);
-        groupModelValidator.validate(group, escapedPathValidation);
+        ValidationContext context = new ValidationContext();
+        validationFacade.validateGroup(group, context);
+        if (escapedPathValidation) {
+            //TODO filter by error type
+        } else {
+            if (context.getErrorGroups().contains(group.getId())) {
+                throw new ValidationException(context.getGroupErrorReason(group.getId()));
+            }
+        }
         autoFiller.autofill(group);
         hideVirtualValue(group);
         groupEntityManager.add(group, false);
         syncMemberStatus(group);
-        return group;
+        return getByKey(new IdVersion(group.getId(), group.getVersion()));
     }
 
     @Override
@@ -143,12 +169,20 @@ public class GroupRepositoryImpl implements GroupRepository {
     @Override
     public Group addVGroup(Group group, boolean escapedPathValidation) throws Exception {
         group.setId(0L);
-        vGroupValidator.validate(group, escapedPathValidation);
-        autoFiller.autofillVGroup(group);
+        ValidationContext context = new ValidationContext();
         group.setVirtual(true);
+        validationFacade.validateGroup(group, context);
+        if (escapedPathValidation) {
+            //TODO filter by error type
+        } else {
+            if (context.getErrorGroups().contains(group.getId())) {
+                throw new ValidationException(context.getGroupErrorReason(group.getId()));
+            }
+        }
+        autoFiller.autofillVGroup(group);
         groupEntityManager.add(group, true);
         hideVirtualValue(group);
-        return group;
+        return getByKey(new IdVersion(group.getId(), group.getVersion()));
     }
 
     @Override
@@ -158,14 +192,21 @@ public class GroupRepositoryImpl implements GroupRepository {
 
     @Override
     public Group update(Group group, boolean escapedPathValidation) throws Exception {
-        if (!groupModelValidator.exists(group.getId()))
-            throw new ValidationException("Group with id " + group.getId() + " does not exist.");
-        groupModelValidator.validate(group, escapedPathValidation);
+        groupModelValidator.checkRestrictionForUpdate(group);
+        ValidationContext context = new ValidationContext();
+        validationFacade.validateGroup(group, context);
+        if (escapedPathValidation) {
+            //TODO filter by error type
+        } else {
+            if (context.getErrorGroups().contains(group.getId())) {
+                throw new ValidationException(context.getGroupErrorReason(group.getId()));
+            }
+        }
         autoFiller.autofill(group);
         hideVirtualValue(group);
         groupEntityManager.update(group);
         syncMemberStatus(group);
-        return group;
+        return getByKey(new IdVersion(group.getId(), group.getVersion()));
     }
 
     @Override
@@ -175,14 +216,21 @@ public class GroupRepositoryImpl implements GroupRepository {
 
     @Override
     public Group updateVGroup(Group group, boolean escapedPathValidation) throws Exception {
-        if (!vGroupValidator.exists(group.getId()))
-            throw new ValidationException("Group with id " + group.getId() + " does not exist.");
-        vGroupValidator.validate(group, escapedPathValidation);
-        autoFiller.autofillVGroup(group);
+        groupModelValidator.checkRestrictionForUpdate(group);
+        ValidationContext context = new ValidationContext();
         group.setVirtual(true);
+        validationFacade.validateGroup(group, context);
+        if (escapedPathValidation) {
+            //TODO filter by error type
+        } else {
+            if (context.getErrorGroups().contains(group.getId())) {
+                throw new ValidationException(context.getGroupErrorReason(group.getId()));
+            }
+        }
+        autoFiller.autofillVGroup(group);
         groupEntityManager.update(group);
         hideVirtualValue(group);
-        return group;
+        return getByKey(new IdVersion(group.getId(), group.getVersion()));
     }
 
     @Override
@@ -194,7 +242,7 @@ public class GroupRepositoryImpl implements GroupRepository {
 
     @Override
     public int deleteVGroup(Long groupId) throws Exception {
-        vGroupValidator.removable(groupId);
+        groupModelValidator.removable(groupId);
         return delete(groupId);
     }
 
@@ -242,6 +290,20 @@ public class GroupRepositoryImpl implements GroupRepository {
 
     private void hideVirtualValue(Group group) {
         group.setVirtual(null);
+    }
+
+    private Map<Long, VirtualServer> buildVsMapping(Long[] vsIds, SelectionMode selectionMode) throws Exception {
+        Set<IdVersion> vsKeys = virtualServerCriteriaQuery.queryByIdsAndMode(vsIds, selectionMode);
+        Map<Long, VirtualServer> map = Maps.uniqueIndex(
+                virtualServerRepository.listAll(vsKeys.toArray(new IdVersion[vsKeys.size()])),
+                new Function<VirtualServer, Long>() {
+                    @Nullable
+                    @Override
+                    public Long apply(@Nullable VirtualServer virtualServer) {
+                        return virtualServer.getId();
+                    }
+                });
+        return map;
     }
 
 }

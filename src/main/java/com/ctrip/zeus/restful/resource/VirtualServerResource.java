@@ -12,7 +12,7 @@ import com.ctrip.zeus.restful.message.view.ViewConstraints;
 import com.ctrip.zeus.restful.message.view.ViewDecorator;
 import com.ctrip.zeus.restful.message.view.VsListView;
 import com.ctrip.zeus.service.build.ConfigHandler;
-import com.ctrip.zeus.service.message.queue.MessageQueueService;
+import com.ctrip.zeus.service.message.queue.MessageQueue;
 import com.ctrip.zeus.service.message.queue.MessageType;
 import com.ctrip.zeus.service.query.CriteriaQueryFactory;
 import com.ctrip.zeus.service.query.QueryEngine;
@@ -23,6 +23,7 @@ import com.ctrip.zeus.service.model.SelectionMode;
 import com.ctrip.zeus.service.model.VirtualServerRepository;
 import com.ctrip.zeus.service.model.IdVersion;
 import com.ctrip.zeus.service.query.VirtualServerCriteriaQuery;
+import com.ctrip.zeus.service.query.sort.SortEngine;
 import com.ctrip.zeus.support.ObjectJsonParser;
 import com.ctrip.zeus.support.ObjectJsonWriter;
 import com.ctrip.zeus.util.MessageUtil;
@@ -67,20 +68,23 @@ public class VirtualServerResource {
     @Resource
     private ViewDecorator viewDecorator;
     @Resource
-    private MessageQueueService messageQueueService;
+    private MessageQueue messageQueue;
     @Resource
     private ConfigHandler configHandler;
+
+    private SortEngine sortEngine = new SortEngine();
 
     private final int TIMEOUT = 1000;
 
     Logger logger = LoggerFactory.getLogger(this.getClass());
 
     /**
-     * @api {get} /api/vses: Request vs information
-     * @apiName ListVirtualServers
-     * @apiGroup Vs
+     * @api {get} /api/vses: [Read] Batch fetch vs data
+     * @apiName ListVSes
+     * @apiGroup VS
      * @apiParam {long[]} vsId          1,2,3
-     * @apiParam {string[]} vsName      a,b,c
+     * @apiParam {string[]} vsName      localhost,80
+     * @apiParam {string[]} fuzzyName   local,8
      * @apiParam {string[]} ip          reserved
      * @apiParam {string[]} domain      a.ctrip.com,b.ctrip.com
      * @apiParam {boolean} ssl          true/false
@@ -107,12 +111,23 @@ public class VirtualServerResource {
         queryRender.init(true);
         IdVersion[] searchKeys = queryRender.run(criteriaQueryFactory);
 
-        VsListView listView = new VsListView();
-        for (VirtualServer vs : virtualServerRepository.listAll(searchKeys)) {
-            listView.add(new ExtendedView.ExtendedVs(vs));
+        List<VirtualServer> result = virtualServerRepository.listAll(searchKeys);
+        ExtendedView.ExtendedVs[] viewArray = new ExtendedView.ExtendedVs[result.size()];
+
+        for (int i = 0; i < result.size(); i++) {
+            viewArray[i] = new ExtendedView.ExtendedVs(result.get(i));
         }
         if (ViewConstraints.EXTENDED.equalsIgnoreCase(type)) {
-            viewDecorator.decorate(listView.getList(), "vs");
+            viewDecorator.decorate(viewArray, "vs");
+        }
+
+        if (queryRender.sortRequired()) {
+            sortEngine.sort(queryRender.getSortProperty(), viewArray, queryRender.isAsc());
+        }
+
+        VsListView listView = new VsListView(result.size());
+        for (int i = queryRender.getOffset(); i < queryRender.getOffset() + queryRender.getLimit(viewArray.length); i++) {
+            listView.add(viewArray[i]);
         }
 
         return responseHandler.handleSerializedValue(ObjectJsonWriter.write(listView, type), hh.getMediaType());
@@ -156,6 +171,14 @@ public class VirtualServerResource {
         return responseHandler.handleSerializedValue(ObjectJsonWriter.write(listView, type), hh.getMediaType());
     }
 
+    /**
+     * @api {post} /api/vs/new: [Write] Create new virtual server
+     * @apiName CreateVS
+     * @apiGroup VS
+     * @apiDescription See [Update vs content](#api-VS-FullUpdateVS) for object description
+     * @apiParam {boolean} [force]             skip all validations and forcibly create a group
+     * @apiSuccess (Success 200) {VirtualServer} vs    newly created vs object
+     **/
     @POST
     @Path("/vs/new")
     @Produces({MediaType.APPLICATION_JSON, MediaType.APPLICATION_XML})
@@ -164,6 +187,9 @@ public class VirtualServerResource {
                                      @Context HttpServletRequest request, String requestBody) throws Exception {
         ExtendedView.ExtendedVs extendedView = ObjectJsonParser.parse(requestBody, ExtendedView.ExtendedVs.class);
         VirtualServer vs = ObjectJsonParser.parse(requestBody, VirtualServer.class);
+        if (vs == null) {
+            throw new ValidationException("Invalid post entity. Fail to parse json to virtual server.");
+        }
         trim(vs);
 
         vs = virtualServerRepository.add(vs);
@@ -182,15 +208,44 @@ public class VirtualServerResource {
         }
         String slbMessageData = MessageUtil.getMessageData(request, null, new VirtualServer[]{vs}, null, null, true);
         if (configHandler.getEnable("use.new,message.queue.producer", false)) {
-            messageQueueService.produceMessage(request.getRequestURI(), vs.getId(), slbMessageData);
+            messageQueue.produceMessage(request.getRequestURI(), vs.getId(), slbMessageData);
         } else {
-            messageQueueService.produceMessage(MessageType.NewVs, vs.getId(), slbMessageData);
+            messageQueue.produceMessage(MessageType.NewVs, vs.getId(), slbMessageData);
         }
 
-        return responseHandler.handle(new ExtendedView.ExtendedVs(vs), hh.getMediaType());
+        return responseHandler.handleSerializedValue(ObjectJsonWriter.write(vs, ViewConstraints.DETAIL), hh.getMediaType());
 
     }
 
+    /**
+     * @api {post} /api/vs/update: [Write] Update vs content
+     * @apiName FullUpdateVS
+     * @apiGroup VS
+     * @apiSuccess {VirtualServer} vs json object
+     * @apiParam {boolean} [force]  skip all validations and forcibly create a vs
+     * @apiParam (VirtualServer) {Long} id                        id
+     * @apiParam (VirtualServer) {String} name                    name
+     * @apiParam (VirtualServer) {Integer} version                version
+     * @apiParam (VirtualServer) {Boolean} ssl                    https vs
+     * @apiParam (VirtualServer) {String} port                    vs port
+     * @apiParam (VirtualServer) {Long[]} slb-ids                 slb dependencies
+     * @apiParam (VirtualServer) {Domain[]} domains               vs domains
+     * @apiParam (VirtualServer) {String[]} [tags]                add tags to group
+     * @apiParam (VirtualServer) {Object[]} [properties]          add/update properties of group
+     * @apiParam (Domain) {String} name                           domain name
+     * @apiExample {json} Usage:
+     *  {
+     *    "version" : 1,
+     *    "name" : "localhost_80",
+     *    "id" : 3,
+     *    "port" : "80",
+     *    "domains" : [ {
+     *      "name" : "localhost_80"
+     *    } ],
+     *    "ssl" : false,
+     *    "slb-ids" : [ 3 ]
+     *  }
+     */
     @POST
     @Path("/vs/update")
     @Produces({MediaType.APPLICATION_JSON, MediaType.APPLICATION_XML})
@@ -199,6 +254,9 @@ public class VirtualServerResource {
                                         @Context HttpServletRequest request, String requestBody) throws Exception {
         ExtendedView.ExtendedVs extendedView = ObjectJsonParser.parse(requestBody, ExtendedView.ExtendedVs.class);
         VirtualServer vs = ObjectJsonParser.parse(requestBody, VirtualServer.class);
+        if (vs == null) {
+            throw new ValidationException("Invalid post entity. Fail to parse json to virtual server.");
+        }
         trim(vs);
 
         IdVersion[] check = virtualServerCriteriaQuery.queryByIdAndMode(vs.getId(), SelectionMode.OFFLINE_FIRST);
@@ -229,12 +287,12 @@ public class VirtualServerResource {
 
         String slbMessageData = MessageUtil.getMessageData(request, null, new VirtualServer[]{vs}, null, null, true);
         if (configHandler.getEnable("use.new,message.queue.producer", false)) {
-            messageQueueService.produceMessage(request.getRequestURI(), vs.getId(), slbMessageData);
+            messageQueue.produceMessage(request.getRequestURI(), vs.getId(), slbMessageData);
         } else {
-            messageQueueService.produceMessage(MessageType.UpdateVs, vs.getId(), slbMessageData);
+            messageQueue.produceMessage(MessageType.UpdateVs, vs.getId(), slbMessageData);
         }
 
-        return responseHandler.handle(new ExtendedView.ExtendedVs(vs), hh.getMediaType());
+        return responseHandler.handleSerializedValue(ObjectJsonWriter.write(vs, ViewConstraints.DETAIL), hh.getMediaType());
     }
 
     @GET
@@ -269,12 +327,12 @@ public class VirtualServerResource {
 
         String slbMessageData = MessageUtil.getMessageData(request, null, new VirtualServer[]{vs}, null, null, true);
         if (configHandler.getEnable("use.new,message.queue.producer", false)) {
-            messageQueueService.produceMessage(request.getRequestURI(), vs.getId(), slbMessageData);
+            messageQueue.produceMessage(request.getRequestURI(), vs.getId(), slbMessageData);
         } else {
-            messageQueueService.produceMessage(MessageType.UpdateVs, vs.getId(), slbMessageData);
+            messageQueue.produceMessage(MessageType.UpdateVs, vs.getId(), slbMessageData);
         }
 
-        return responseHandler.handle(new ExtendedView.ExtendedVs(vs), hh.getMediaType());
+        return responseHandler.handleSerializedValue(ObjectJsonWriter.write(vs, ViewConstraints.DETAIL), hh.getMediaType());
     }
 
     @GET
@@ -317,11 +375,11 @@ public class VirtualServerResource {
 
         String slbMessageData = MessageUtil.getMessageData(request, null, new VirtualServer[]{vs}, null, null, true);
         if (configHandler.getEnable("use.new,message.queue.producer", false)) {
-            messageQueueService.produceMessage(request.getRequestURI(), vs.getId(), slbMessageData);
+            messageQueue.produceMessage(request.getRequestURI(), vs.getId(), slbMessageData);
         } else {
-            messageQueueService.produceMessage(MessageType.UpdateVs, vs.getId(), slbMessageData);
+            messageQueue.produceMessage(MessageType.UpdateVs, vs.getId(), slbMessageData);
         }
-        return responseHandler.handle(new ExtendedView.ExtendedVs(vs), hh.getMediaType());
+        return responseHandler.handleSerializedValue(ObjectJsonWriter.write(vs, ViewConstraints.DETAIL), hh.getMediaType());
     }
 
     @GET
@@ -354,9 +412,9 @@ public class VirtualServerResource {
 
         String slbMessageData = MessageUtil.getMessageData(request, null, null, null, null, true);
         if (configHandler.getEnable("use.new,message.queue.producer", false)) {
-            messageQueueService.produceMessage(request.getRequestURI(), vsId, slbMessageData);
+            messageQueue.produceMessage(request.getRequestURI(), vsId, slbMessageData);
         } else {
-            messageQueueService.produceMessage(MessageType.DeleteVs, vsId, slbMessageData);
+            messageQueue.produceMessage(MessageType.DeleteVs, vsId, slbMessageData);
         }
         return responseHandler.handle("Successfully deleted virtual server with id " + vsId + ".", hh.getMediaType());
     }

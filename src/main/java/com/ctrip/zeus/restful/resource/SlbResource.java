@@ -12,17 +12,21 @@ import com.ctrip.zeus.restful.message.view.ExtendedView;
 import com.ctrip.zeus.restful.message.view.SlbListView;
 import com.ctrip.zeus.restful.message.view.ViewConstraints;
 import com.ctrip.zeus.restful.message.view.ViewDecorator;
+import com.ctrip.zeus.service.build.ConfigHandler;
+import com.ctrip.zeus.service.message.queue.MessageQueue;
+import com.ctrip.zeus.service.message.queue.MessageType;
 import com.ctrip.zeus.service.model.ArchiveRepository;
 import com.ctrip.zeus.service.model.SelectionMode;
 import com.ctrip.zeus.service.model.SlbRepository;
 import com.ctrip.zeus.service.model.IdVersion;
-import com.ctrip.zeus.service.model.impl.RepositoryContext;
 import com.ctrip.zeus.service.query.*;
+import com.ctrip.zeus.service.query.sort.SortEngine;
 import com.ctrip.zeus.support.ObjectJsonParser;
 import com.ctrip.zeus.support.ObjectJsonWriter;
 import com.ctrip.zeus.tag.PropertyBox;
 import com.ctrip.zeus.tag.TagBox;
 import com.ctrip.zeus.tag.entity.Property;
+import com.ctrip.zeus.util.MessageUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -61,17 +65,23 @@ public class SlbResource {
     private TagBox tagBox;
     @Resource
     private ViewDecorator viewDecorator;
+    @Resource
+    private MessageQueue messageQueue;
+    @Resource
+    private ConfigHandler configHandler;
 
+    private SortEngine sortEngine = new SortEngine();
     private final int TIMEOUT = 1000;
 
     Logger logger = LoggerFactory.getLogger(this.getClass());
 
     /**
-     * @api {get} /api/slbs: Request slb information
+     * @api {get} /api/slbs: [Read] Batch fetch slb data
      * @apiName ListSlbs
      * @apiGroup Slb
      * @apiParam {long[]} slbId         1,2,3
-     * @apiParam {string[]} slbName     a,b,c
+     * @apiParam {string[]} slbName     slb,dev
+     * @apiParam {string[]} fuzzyName   sl,d
      * @apiParam {string[]} ip          10.2.1.1,10.2.11.21
      * @apiParam {string[]} vip         not supported yet
      * @apiParam {string} mode          get {online/offline/redundant} (redundant=online&offline) version
@@ -97,12 +107,23 @@ public class SlbResource {
         queryRender.init(true);
         IdVersion[] searchKeys = queryRender.run(criteriaQueryFactory);
 
-        SlbListView listView = new SlbListView();
-        for (Slb slb : slbRepository.list(searchKeys)) {
-            listView.add(new ExtendedView.ExtendedSlb(slb));
+        List<Slb> result = slbRepository.list(searchKeys);
+        ExtendedView.ExtendedSlb[] viewArray = new ExtendedView.ExtendedSlb[result.size()];
+
+        for (int i = 0; i < result.size(); i++) {
+            viewArray[i] = new ExtendedView.ExtendedSlb(result.get(i));
         }
         if (ViewConstraints.EXTENDED.equalsIgnoreCase(type)) {
-            viewDecorator.decorate(listView.getList(), "slb");
+            viewDecorator.decorate(viewArray, "slb");
+        }
+
+        if (queryRender.sortRequired()) {
+            sortEngine.sort(queryRender.getSortProperty(), viewArray, queryRender.isAsc());
+        }
+
+        SlbListView listView = new SlbListView(result.size());
+        for (int i = queryRender.getOffset(); i < queryRender.getOffset() + queryRender.getLimit(viewArray.length); i++) {
+            listView.add(viewArray[i]);
         }
 
         return responseHandler.handleSerializedValue(ObjectJsonWriter.write(listView, type), hh.getMediaType());
@@ -152,7 +173,17 @@ public class SlbResource {
     public Response add(@Context HttpHeaders hh, @Context HttpServletRequest request, String requestBody) throws Exception {
         ExtendedView.ExtendedSlb extendedView = ObjectJsonParser.parse(requestBody, ExtendedView.ExtendedSlb.class);
         Slb s = ObjectJsonParser.parse(requestBody, Slb.class);
+        if (s == null) {
+            throw new ValidationException("Invalid post entity. Fail to parse json to slb.");
+        }
+        if (s.getName() == null) {
+            throw new ValidationException("Field `name` is not allowed empty.");
+        }
         trim(s);
+        Long checkId = slbCriteriaQuery.queryByName(s.getName());
+        if (checkId > 0L) {
+            throw new ValidationException("Slb name " + s.getName() + " has been taken by " + checkId + ".");
+        }
 
         s = slbRepository.add(s);
 
@@ -169,7 +200,14 @@ public class SlbResource {
             addTag(s.getId(), extendedView.getTags());
         }
 
-        return responseHandler.handle(new ExtendedView.ExtendedSlb(s), hh.getMediaType());
+        String slbMessageData = MessageUtil.getMessageData(request, null, null, new Slb[]{s}, null, true);
+        if (configHandler.getEnable("use.new,message.queue.producer", false)) {
+            messageQueue.produceMessage(request.getRequestURI(), s.getId(), slbMessageData);
+        } else {
+            messageQueue.produceMessage(MessageType.NewSlb, s.getId(), slbMessageData);
+        }
+
+        return responseHandler.handleSerializedValue(ObjectJsonWriter.write(new ExtendedView.ExtendedSlb(s), ViewConstraints.DETAIL), hh.getMediaType());
     }
 
     @POST
@@ -179,7 +217,17 @@ public class SlbResource {
     public Response update(@Context HttpHeaders hh, @Context HttpServletRequest request, String requestBody) throws Exception {
         ExtendedView.ExtendedSlb extendedView = ObjectJsonParser.parse(requestBody, ExtendedView.ExtendedSlb.class);
         Slb s = ObjectJsonParser.parse(requestBody, Slb.class);
+        if (s == null) {
+            throw new ValidationException("Invalid post entity. Fail to parse json to slb.");
+        }
+        if (s.getName() == null) {
+            throw new ValidationException("Field `name` is not allowed empty.");
+        }
         trim(s);
+        Long checkId = slbCriteriaQuery.queryByName(s.getName());
+        if (checkId > 0L && !checkId.equals(s.getId())) {
+            throw new ValidationException("Slb name " + s.getName() + " has been taken by " + checkId + ".");
+        }
 
         IdVersion[] check = slbCriteriaQuery.queryByIdAndMode(s.getId(), SelectionMode.OFFLINE_FIRST);
         if (check.length == 0) throw new ValidationException("Slb " + s.getId() + " cannot be found.");
@@ -206,7 +254,14 @@ public class SlbResource {
             addTag(s.getId(), extendedView.getTags());
         }
 
-        return responseHandler.handle(new ExtendedView.ExtendedSlb(s), hh.getMediaType());
+        String slbMessageData = MessageUtil.getMessageData(request, null, null, new Slb[]{s}, null, true);
+        if (configHandler.getEnable("use.new,message.queue.producer", false)) {
+            messageQueue.produceMessage(request.getRequestURI(), s.getId(), slbMessageData);
+        } else {
+            messageQueue.produceMessage(MessageType.UpdateSlb, s.getId(), slbMessageData);
+        }
+
+        return responseHandler.handleSerializedValue(ObjectJsonWriter.write(new ExtendedView.ExtendedSlb(s), ViewConstraints.DETAIL), hh.getMediaType());
     }
 
     @GET
@@ -217,6 +272,7 @@ public class SlbResource {
         if (slbId == null) {
             throw new Exception("Query param - slbId is required.");
         }
+
         Slb archive = slbRepository.getById(slbId);
         if (archive == null) throw new ValidationException("Slb cannot be found with id " + slbId + ".");
 
@@ -237,6 +293,14 @@ public class SlbResource {
         }
 
         String message = count == 1 ? "Delete slb successfully." : "No deletion is needed.";
+
+        String slbMessageData = MessageUtil.getMessageData(request, null, null, new Slb[]{archive}, null, true);
+        if (configHandler.getEnable("use.new,message.queue.producer", false)) {
+            messageQueue.produceMessage(request.getRequestURI(), archive.getId(), slbMessageData);
+        } else {
+            messageQueue.produceMessage(MessageType.DeleteSlb, archive.getId(), slbMessageData);
+        }
+
         return responseHandler.handle(message, hh.getMediaType());
     }
 
@@ -257,10 +321,7 @@ public class SlbResource {
 
         Slb slb;
         try {
-            RepositoryContext ctxt = new RepositoryContext();
-            ctxt.setLite(true);
-
-            slb = slbRepository.getByKey(searchKey[0], ctxt);
+            slb = slbRepository.getByKey(searchKey[0]);
             for (SlbServer server : serverList.getSlbServers()) {
                 slb.addSlbServer(server);
             }
@@ -277,7 +338,18 @@ public class SlbResource {
         } catch (Exception ex) {
         }
 
-        return responseHandler.handle(new ExtendedView.ExtendedSlb(slb), hh.getMediaType());
+        String[] ips = new String[serverList.getSlbServers().size()];
+        for (int i = 0; i < ips.length; i++) {
+            ips[i] = serverList.getSlbServers().get(i).getIp();
+        }
+        String slbMessageData = MessageUtil.getMessageData(request, null, null, new Slb[]{slb}, ips, true);
+        if (configHandler.getEnable("use.new,message.queue.producer", false)) {
+            messageQueue.produceMessage(request.getRequestURI(), slb.getId(), slbMessageData);
+        } else {
+            messageQueue.produceMessage(MessageType.UpdateSlb, slb.getId(), slbMessageData);
+        }
+
+        return responseHandler.handleSerializedValue(ObjectJsonWriter.write(new ExtendedView.ExtendedSlb(slb), ViewConstraints.DETAIL), hh.getMediaType());
     }
 
     @GET
@@ -295,26 +367,21 @@ public class SlbResource {
 
         Slb slb;
         try {
-            RepositoryContext ctxt = new RepositoryContext();
-            ctxt.setLite(true);
-
             Set<String> servers = new HashSet<>();
             for (String s : ip.split(",")) {
                 servers.add(s);
             }
 
-            slb = slbRepository.getByKey(searchKey[0], ctxt);
+            slb = slbRepository.getByKey(searchKey[0]);
             Iterator<SlbServer> iter = slb.getSlbServers().iterator();
 
             while (iter.hasNext()) {
                 SlbServer server = iter.next();
                 if (servers.contains(server.getIp())) {
                     iter.remove();
-                    break;
                 }
             }
             slb = slbRepository.update(slb);
-
         } finally {
             lock.unlock();
         }
@@ -326,7 +393,14 @@ public class SlbResource {
         } catch (Exception ex) {
         }
 
-        return responseHandler.handle(new ExtendedView.ExtendedSlb(slb), hh.getMediaType());
+        String slbMessageData = MessageUtil.getMessageData(request, null, null, new Slb[]{slb}, new String[]{ip}, true);
+        if (configHandler.getEnable("use.new,message.queue.producer", false)) {
+            messageQueue.produceMessage(request.getRequestURI(), slb.getId(), slbMessageData);
+        } else {
+            messageQueue.produceMessage(MessageType.UpdateSlb, slb.getId(), slbMessageData);
+        }
+
+        return responseHandler.handleSerializedValue(ObjectJsonWriter.write(new ExtendedView.ExtendedSlb(slb), ViewConstraints.DETAIL), hh.getMediaType());
     }
 
     private void setProperties(Long slbId, List<Property> properties) {
@@ -351,12 +425,6 @@ public class SlbResource {
 
     private void trim(Slb s) throws Exception {
         s.setName(trimIfNotNull(s.getName()));
-        for (VirtualServer virtualServer : s.getVirtualServers()) {
-            virtualServer.setName(trimIfNotNull(virtualServer.getName()));
-            for (Domain domain : virtualServer.getDomains()) {
-                domain.setName(trimIfNotNull(domain.getName()));
-            }
-        }
         for (SlbServer slbServer : s.getSlbServers()) {
             slbServer.setIp(trimIfNotNull(slbServer.getIp()));
             slbServer.setHostName(trimIfNotNull(slbServer.getHostName()));

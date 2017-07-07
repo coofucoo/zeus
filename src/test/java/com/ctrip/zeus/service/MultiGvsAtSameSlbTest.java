@@ -1,6 +1,7 @@
 package com.ctrip.zeus.service;
 
 import com.ctrip.zeus.AbstractServerTest;
+import com.ctrip.zeus.commit.entity.ConfSlbVersion;
 import com.ctrip.zeus.dal.core.*;
 import com.ctrip.zeus.model.entity.*;
 import com.ctrip.zeus.nginx.entity.ConfFile;
@@ -10,6 +11,7 @@ import com.ctrip.zeus.nginx.entity.Vhosts;
 import com.ctrip.zeus.nginx.transform.DefaultJsonParser;
 import com.ctrip.zeus.service.build.BuildService;
 import com.ctrip.zeus.service.build.NginxConfService;
+import com.ctrip.zeus.service.version.ConfVersionService;
 import com.ctrip.zeus.support.GenericSerializer;
 import com.ctrip.zeus.util.CompressUtils;
 import com.google.common.collect.Lists;
@@ -17,10 +19,8 @@ import com.google.common.collect.Sets;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
-import org.unidal.dal.jdbc.DalException;
 
 import javax.annotation.Resource;
-import java.io.IOException;
 import java.util.*;
 
 /**
@@ -51,11 +51,13 @@ public class MultiGvsAtSameSlbTest extends AbstractServerTest {
     private BuildService buildService;
     @Resource
     private NginxConfService nginxConfService;
+    @Resource
+    private ConfVersionService confVersionService;
 
     private static boolean inited = false;
 
     @Before
-    public void setCurrentVersion() throws DalException, IOException {
+    public void setCurrentVersion() throws Exception {
         if (inited) return;
         buildInfoDao.insert(new BuildInfoDo().setSlbId(1L).setPendingTicket(2).setCurrentTicket(1));
         nginxConfDao.insert(new NginxConfDo().setSlbId(1L).setVersion(1).setContent("nginx.conf"));
@@ -79,6 +81,7 @@ public class MultiGvsAtSameSlbTest extends AbstractServerTest {
 
         nginxConfSlbDao.insert(new NginxConfSlbDo().setSlbId(1L).setVersion(1)
                 .setContent(CompressUtils.compress(GenericSerializer.writeJson(currentConf))));
+        confVersionService.addConfSlbVersion(new ConfSlbVersion().setSlbId(1L).setCurrentVersion(1L).setPreviousVersion(0L));
         inited = true;
     }
 
@@ -87,13 +90,12 @@ public class MultiGvsAtSameSlbTest extends AbstractServerTest {
         Slb slb = new Slb().setId(1L).addSlbServer(new SlbServer().setIp("127.0.0.1")).setVersion(1);
         Map<Long, VirtualServer> onlineVses = new HashMap<>();
         for (int i = 1; i < 7; i++) {
-            VirtualServer vs = new VirtualServer().setId(new Long(i)).addDomain(new Domain().setName("test" + i + "test.domain.com")).setPort("80");
-            slb.addVirtualServer(vs);
+            VirtualServer vs = new VirtualServer().setId((long) i).addDomain(new Domain().setName("test" + i + "test.domain.com")).setPort("80");
             onlineVses.put(vs.getId(), vs);
         }
         Map<Long, List<Group>> vsGroups = new HashMap<>();
         for (int i = 0; i < 7; i++) {
-            vsGroups.put(new Long(i), new ArrayList<Group>());
+            vsGroups.put((long) i, new ArrayList<Group>());
         }
         vsGroups.remove(5L);
         vsGroups.get(4L).add(generateGroup(1L, new Long[]{4L}));
@@ -108,7 +110,7 @@ public class MultiGvsAtSameSlbTest extends AbstractServerTest {
         Group g12 = generateGroup(9L, new Long[]{1L, 2L});
         vsGroups.get(1L).add(g12);
         vsGroups.get(2L).add(g12);
-        buildService.build(slb, onlineVses, Sets.newHashSet(1L, 2L, 3L, 4L), Sets.newHashSet(5L), vsGroups, new HashSet<String>(), new HashSet<String>());
+        buildService.build(slb, onlineVses, Sets.newHashSet(1L, 2L, 3L, 4L), Sets.newHashSet(5L), new HashMap<Long, List<TrafficPolicy>>(), vsGroups, new HashSet<String>(), new HashSet<String>());
 
         NginxConfEntry expectedNextConf = new NginxConfEntry().setUpstreams(new Upstreams()).setVhosts(new Vhosts());
         Map<String, Integer> vhostIndex = new HashMap<>();
@@ -189,7 +191,7 @@ public class MultiGvsAtSameSlbTest extends AbstractServerTest {
         for (Long id : vsIds) {
             VirtualServer vs = new VirtualServer().setId(id);
             vs.getSlbIds().add(1L);
-            group.addGroupVirtualServer(new GroupVirtualServer().setPath("/" + groupId).setVirtualServer(vs));
+            group.addGroupVirtualServer(new GroupVirtualServer().setPath("/" + groupId).setPriority(1000).setVirtualServer(vs));
         }
         return group;
     }

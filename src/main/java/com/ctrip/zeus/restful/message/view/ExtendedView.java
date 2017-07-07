@@ -1,12 +1,14 @@
 package com.ctrip.zeus.restful.message.view;
 
 import com.ctrip.zeus.model.entity.*;
+import com.ctrip.zeus.service.query.sort.PropertySortable;
 import com.ctrip.zeus.tag.entity.Property;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonView;
-import com.netflix.config.DynamicBooleanProperty;
 import com.netflix.config.DynamicPropertyFactory;
+import com.netflix.config.DynamicStringProperty;
 
+import java.util.Date;
 import java.util.List;
 
 /**
@@ -29,7 +31,7 @@ public interface ExtendedView<T> {
     @JsonIgnore
     T getInstance();
 
-    class ExtendedGroup extends GroupView implements ExtendedView<Group> {
+    class ExtendedGroup extends GroupView implements ExtendedView<Group>, PropertySortable {
         private List<String> tags;
         private List<Property> properties;
         private Group instance;
@@ -56,7 +58,6 @@ public interface ExtendedView<T> {
         public String getAppId() {
             return instance.getAppId();
         }
-
 
         @Override
         HealthCheck getHealthCheck() {
@@ -89,10 +90,12 @@ public interface ExtendedView<T> {
         }
 
         @Override
+        Date getCreatedTime() {
+            return instance.getCreatedTime();
+        }
+
+        @Override
         List<GroupVirtualServer> getGroupVirtualServers() {
-            for (GroupVirtualServer gvs : instance.getGroupVirtualServers()) {
-                ExtendedVs.renderVirtualServer(gvs.getVirtualServer());
-            }
             return instance.getGroupVirtualServers();
         }
 
@@ -120,11 +123,34 @@ public interface ExtendedView<T> {
         public Group getInstance() {
             return instance;
         }
+
+        @Override
+        public Comparable getValue(String property) {
+            switch (property) {
+                case "id":
+                    return getId();
+                case "name":
+                    return getName();
+                case "created-time":
+                    return getCreatedTime();
+                default:
+                    if (property.startsWith("property:")) {
+                        if (getProperties() == null) return null;
+
+                        String propName = property.substring("property:".length());
+                        for (Property p : getProperties()) {
+                            if (p.getName().equals(propName)) {
+                                return p.getValue();
+                            }
+                        }
+                        return null;
+                    }
+                    return null;
+            }
+        }
     }
 
-    class ExtendedVs extends VsView implements ExtendedView<VirtualServer> {
-        private static DynamicBooleanProperty n2nViewEnabled = DynamicPropertyFactory.getInstance().getBooleanProperty("slb.slb-vs-n2n.view.enabled", false);
-
+    class ExtendedVs extends VsView implements ExtendedView<VirtualServer>, PropertySortable {
         private List<String> tags;
         private List<Property> properties;
         private VirtualServer instance;
@@ -153,27 +179,8 @@ public interface ExtendedView<T> {
         }
 
         @Override
-        Long getSlbId() {
-            if (n2nViewEnabled.get()) {
-                return null;
-            } else {
-                if (instance.getSlbId() == null && instance.getSlbIds().size() > 0) {
-                    instance.setSlbId(instance.getSlbIds().get(0));
-                }
-                return instance.getSlbId();
-            }
-        }
-
-        @Override
         List<Long> getSlbIds() {
-            if (n2nViewEnabled.get()) {
-                if (instance.getSlbIds().size() == 0 && instance.getSlbId() != null) {
-                    instance.getSlbIds().add(instance.getSlbId());
-                }
-                return instance.getSlbIds();
-            } else {
-                return null;
-            }
+            return instance.getSlbIds();
         }
 
         @Override
@@ -189,6 +196,11 @@ public interface ExtendedView<T> {
         @Override
         List<Domain> getDomains() {
             return instance.getDomains();
+        }
+
+        @Override
+        Date getCreatedTime() {
+            return instance.getCreatedTime();
         }
 
         @Override
@@ -213,25 +225,40 @@ public interface ExtendedView<T> {
 
         @Override
         public VirtualServer getInstance() {
-            return null;
+            return instance;
         }
 
-        public static void renderVirtualServer(VirtualServer vs) {
-            if (n2nViewEnabled.get()) {
-                if (vs.getSlbIds().size() == 0 && vs.getSlbId() != null) {
-                    vs.getSlbIds().add(vs.getSlbId());
-                }
-                vs.setSlbId(null);
-            } else {
-                if (vs.getSlbId() == null && vs.getSlbIds().size() > 0) {
-                    vs.setSlbId(vs.getSlbIds().get(0));
-                }
-                vs.getSlbIds().clear();
+        @Override
+        public Comparable getValue(String property) {
+            switch (property) {
+                case "id":
+                    return getId();
+                case "name":
+                    return getName();
+                case "domain":
+                    return getDomains().size() > 0 ? getDomains().get(0).getName() : null;
+                case "ssl":
+                    return getSsl();
+                case "created-time":
+                    return getCreatedTime();
+                default:
+                    if (property.startsWith("property:")) {
+                        if (getProperties() == null) return null;
+
+                        String propName = property.substring("property:".length());
+                        for (Property p : getProperties()) {
+                            if (p.getName().equals(propName)) {
+                                return p.getValue();
+                            }
+                        }
+                        return null;
+                    }
+                    return null;
             }
         }
     }
 
-    class ExtendedSlb extends SlbView implements ExtendedView<Slb> {
+    class ExtendedSlb extends SlbView implements ExtendedView<Slb>, PropertySortable {
         private List<String> tags;
         private List<Property> properties;
         private Slb instance;
@@ -290,11 +317,8 @@ public interface ExtendedView<T> {
         }
 
         @Override
-        List<VirtualServer> getVirtualServers() {
-            for (VirtualServer vs : instance.getVirtualServers()) {
-                ExtendedVs.renderVirtualServer(vs);
-            }
-            return instance.getVirtualServers();
+        Date getCreatedTime() {
+            return instance.getCreatedTime();
         }
 
         @Override
@@ -319,7 +343,96 @@ public interface ExtendedView<T> {
 
         @Override
         public Slb getInstance() {
-            return null;
+            return instance;
+        }
+
+        @Override
+        public Comparable getValue(String property) {
+            switch (property) {
+                case "id":
+                    return getId();
+                case "name":
+                    return getName();
+                case "created-time":
+                    return getCreatedTime();
+                default:
+                    if (property.startsWith("property:")) {
+                        if (getProperties() == null) return null;
+
+                        String propName = property.substring("property:".length());
+                        for (Property p : getProperties()) {
+                            if (p.getName().equals(propName)) {
+                                return p.getValue();
+                            }
+                        }
+                        return null;
+                    }
+                    return null;
+            }
+        }
+    }
+
+    class ExtendedTrafficPolicy implements ExtendedView<TrafficPolicy> {
+        private List<String> tags;
+        private List<Property> properties;
+        private final TrafficPolicy instance;
+
+        public ExtendedTrafficPolicy() {
+            this(new TrafficPolicy());
+        }
+
+        public ExtendedTrafficPolicy(TrafficPolicy instance) {
+            this.instance = instance;
+        }
+
+        @Override
+        public Long getId() {
+            return instance.getId();
+        }
+
+        public List<TrafficControl> getControls() {
+            return instance.getControls();
+        }
+
+        public String getName() {
+            return instance.getName();
+        }
+
+        public List<PolicyVirtualServer> getPolicyVirtualServers() {
+            return instance.getPolicyVirtualServers();
+        }
+
+        public Integer getVersion() {
+            return instance.getVersion();
+        }
+
+        public Date getCreatedTime() {
+            return instance.getCreatedTime();
+        }
+
+        @Override
+        public void setTags(List<String> tags) {
+            this.tags = tags;
+        }
+
+        @Override
+        public void setProperties(List<Property> properties) {
+            this.properties = properties;
+        }
+
+        @Override
+        public List<String> getTags() {
+            return tags;
+        }
+
+        @Override
+        public List<Property> getProperties() {
+            return properties;
+        }
+
+        @Override
+        public TrafficPolicy getInstance() {
+            return getInstance();
         }
     }
 }
